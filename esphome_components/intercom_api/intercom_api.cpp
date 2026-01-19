@@ -160,12 +160,58 @@ void IntercomApi::setup() {
     return;
   }
 
+  // Deferred publish of initial sensor values (wait for sensors to be fully ready)
+  this->set_timeout(250, [this]() {
+    this->publish_state_();
+    this->publish_destination_();
+  });
+
+  // Sync state from registered entities AFTER ESPHome has restored them
+  // This ensures the parent component has the correct state from boot
+  // NOTE: Don't use has_state() here - it's false at boot even if state is valid from flash
+  this->set_timeout(0, [this]() {
+    // Sync auto_answer from switch (state is valid even if has_state() is false)
+    if (this->auto_answer_switch_ != nullptr) {
+      this->auto_answer_ = this->auto_answer_switch_->state;
+      ESP_LOGD(TAG, "Synced auto_answer from switch: %s", this->auto_answer_ ? "ON" : "OFF");
+    }
+
+    // Sync volume from number
+    if (this->volume_number_ != nullptr) {
+      this->volume_ = this->volume_number_->state / 100.0f;
+      ESP_LOGD(TAG, "Synced volume from number: %.0f%%", this->volume_number_->state);
+    }
+
+    // Sync mic gain from number
+    if (this->mic_gain_number_ != nullptr) {
+      float db = this->mic_gain_number_->state;
+      this->mic_gain_ = powf(10.0f, db / 20.0f);
+      ESP_LOGD(TAG, "Synced mic_gain from number: %.1fdB", db);
+    }
+
+#ifdef USE_ESP_AEC
+    // Sync AEC from switch
+    if (this->aec_switch_ != nullptr) {
+      this->aec_enabled_ = this->aec_switch_->state;
+      ESP_LOGD(TAG, "Synced AEC from switch: %s", this->aec_enabled_ ? "ON" : "OFF");
+    }
+#endif
+  });
+
   ESP_LOGI(TAG, "Intercom API ready on port %d", INTERCOM_PORT);
 }
 
 void IntercomApi::loop() {
-  // Main loop - mostly handled by tasks
-  // Just update state for HA
+  // Main loop - mostly handled by FreeRTOS tasks
+
+  // Check ringing timeout (if configured and currently ringing)
+  if (this->ringing_timeout_ms_ > 0 && this->is_ringing()) {
+    uint32_t now = millis();
+    if (now - this->ringing_start_time_ >= this->ringing_timeout_ms_) {
+      ESP_LOGI(TAG, "Ringing timeout after %u ms - auto-declining", this->ringing_timeout_ms_);
+      this->decline_call();
+    }
+  }
 }
 
 void IntercomApi::dump_config() {
@@ -182,6 +228,28 @@ void IntercomApi::dump_config() {
     ESP_LOGCONFIG(TAG, "  AEC: configured (frame_size=%d samples)", this->aec_frame_samples_);
   } else {
     ESP_LOGCONFIG(TAG, "  AEC: none");
+  }
+#endif
+}
+
+void IntercomApi::publish_entity_states() {
+  // Publish restored entity states to HA
+  // Call this from YAML: api: on_client_connected: - lambda: 'id(intercom).publish_entity_states();'
+  // This ensures HA sees values on boot, reconnect, and HA restart
+  ESP_LOGI(TAG, "Publishing entity states to HA");
+
+  if (this->volume_number_ != nullptr) {
+    this->volume_number_->publish_state(this->volume_number_->state);
+  }
+  if (this->mic_gain_number_ != nullptr) {
+    this->mic_gain_number_->publish_state(this->mic_gain_number_->state);
+  }
+  if (this->auto_answer_switch_ != nullptr) {
+    this->auto_answer_switch_->publish_state(this->auto_answer_);
+  }
+#ifdef USE_ESP_AEC
+  if (this->aec_switch_ != nullptr) {
+    this->aec_switch_->publish_state(this->aec_enabled_);
   }
 #endif
 }
@@ -224,6 +292,7 @@ void IntercomApi::stop() {
 
   this->state_ = ConnectionState::DISCONNECTED;
   this->publish_state_();
+  this->idle_trigger_.trigger();  // Fire on_idle automation
 }
 
 void IntercomApi::answer_call() {
@@ -263,6 +332,21 @@ void IntercomApi::decline_call() {
   this->close_client_socket_();
   this->state_ = ConnectionState::DISCONNECTED;
   this->publish_state_();
+  this->idle_trigger_.trigger();  // Fire on_idle automation
+}
+
+void IntercomApi::call_toggle() {
+  // Smart call toggle: ringing → answer, active → hangup, idle → start
+  if (this->is_ringing()) {
+    ESP_LOGI(TAG, "call_toggle: answering ringing call");
+    this->answer_call();
+  } else if (this->is_active()) {
+    ESP_LOGI(TAG, "call_toggle: hanging up active call");
+    this->stop();
+  } else {
+    ESP_LOGI(TAG, "call_toggle: starting new call");
+    this->start();
+  }
 }
 
 void IntercomApi::set_volume(float volume) {
@@ -340,6 +424,108 @@ void IntercomApi::publish_state_() {
   }
 }
 
+// === Contacts Management ===
+
+void IntercomApi::set_contacts(const std::string &contacts_csv) {
+  // PTMP only - in P2P mode, contacts are not used
+  if (!this->ptmp_mode_) return;
+
+  // Parse CSV: "Home Assistant,Intercom Mini,Intercom Xiaozhi"
+  // Exclude this device's own name from contacts
+  this->contacts_.clear();
+
+  if (contacts_csv.empty()) {
+    this->contacts_.push_back("Home Assistant");
+  } else {
+    std::string data = contacts_csv;
+    size_t pos;
+    while (!data.empty()) {
+      pos = data.find(',');
+      std::string name = (pos != std::string::npos) ? data.substr(0, pos) : data;
+
+      // Trim whitespace
+      while (!name.empty() && name[0] == ' ') name.erase(0, 1);
+      while (!name.empty() && name[name.size() - 1] == ' ') name.erase(name.size() - 1);
+
+      // Add if not empty and not this device
+      if (!name.empty() && name != this->device_name_) {
+        this->contacts_.push_back(name);
+      }
+
+      if (pos == std::string::npos) break;
+      data.erase(0, pos + 1);
+    }
+  }
+
+  // Ensure at least "Home Assistant" is available
+  if (this->contacts_.empty()) {
+    this->contacts_.push_back("Home Assistant");
+  }
+
+  // Reset to first contact
+  this->contact_index_ = 0;
+  this->publish_destination_();
+  this->publish_contacts_();  // Publish updated contacts list
+
+  ESP_LOGI(TAG, "Contacts updated: %d devices", this->contacts_.size());
+}
+
+void IntercomApi::next_contact() {
+  if (!this->ptmp_mode_) return;  // PTMP only
+  if (this->contacts_.empty()) return;
+  this->contact_index_ = (this->contact_index_ + 1) % this->contacts_.size();
+  this->publish_destination_();
+  ESP_LOGI(TAG, "Selected contact: %s", this->get_current_destination().c_str());
+}
+
+void IntercomApi::prev_contact() {
+  if (!this->ptmp_mode_) return;  // PTMP only
+  if (this->contacts_.empty()) return;
+  this->contact_index_ = (this->contact_index_ + this->contacts_.size() - 1) % this->contacts_.size();
+  this->publish_destination_();
+  ESP_LOGI(TAG, "Selected contact: %s", this->get_current_destination().c_str());
+}
+
+const std::string &IntercomApi::get_current_destination() const {
+  static const std::string default_dest = "Home Assistant";
+  if (this->contacts_.empty()) return default_dest;
+  return this->contacts_[this->contact_index_ % this->contacts_.size()];
+}
+
+void IntercomApi::publish_destination_() {
+  if (this->destination_sensor_ != nullptr) {
+    this->destination_sensor_->publish_state(this->get_current_destination());
+  }
+}
+
+void IntercomApi::publish_caller_(const std::string &caller_name) {
+  if (this->caller_sensor_ != nullptr) {
+    this->caller_sensor_->publish_state(caller_name);
+  }
+}
+
+void IntercomApi::publish_contacts_() {
+  if (this->contacts_sensor_ != nullptr) {
+    // Publish count only (e.g. "3 contacts"), not the full CSV
+    // Full list available via get_contacts_csv() if needed
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%d contact%s",
+             (int)this->contacts_.size(),
+             this->contacts_.size() == 1 ? "" : "s");
+    this->contacts_sensor_->publish_state(buf);
+  }
+}
+
+std::string IntercomApi::get_contacts_csv() const {
+  // Full CSV available for lambdas/debugging, not published to sensor
+  std::string result;
+  for (size_t i = 0; i < this->contacts_.size(); i++) {
+    if (i > 0) result += ",";
+    result += this->contacts_[i];
+  }
+  return result;
+}
+
 // === State Helpers ===
 
 void IntercomApi::set_active_(bool on) {
@@ -397,6 +583,7 @@ void IntercomApi::set_streaming_(bool on) {
   this->state_ = on ? ConnectionState::STREAMING : ConnectionState::CONNECTED;
   if (on) {
     this->pending_incoming_call_ = false;  // Call answered, no longer pending
+    this->streaming_trigger_.trigger();  // Fire on_streaming automation
   }
   this->publish_state_();
 }
@@ -949,8 +1136,23 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
     case MessageType::START: {
       // Check for NO_RING flag (used for caller in bridge mode - skip ringing)
       const bool no_ring = (header.flags & static_cast<uint8_t>(MessageFlags::NO_RING)) != 0;
-      ESP_LOGI(TAG, "Received START from client (auto_answer=%s, no_ring=%s)",
-               this->auto_answer_ ? "ON" : "OFF", no_ring ? "YES" : "NO");
+
+      // Extract caller name from payload (if present)
+      std::string caller_name;
+      if (header.length > 0 && data != nullptr) {
+        // Payload is the caller name (null-terminated or up to length)
+        size_t name_len = strnlen(reinterpret_cast<const char *>(data), header.length);
+        caller_name.assign(reinterpret_cast<const char *>(data), name_len);
+      }
+
+      ESP_LOGI(TAG, "Received START from client (auto_answer=%s, no_ring=%s, caller=%s)",
+               this->auto_answer_ ? "ON" : "OFF", no_ring ? "YES" : "NO",
+               caller_name.empty() ? "(none)" : caller_name.c_str());
+
+      // Publish caller name (even if empty - clears previous)
+      if (this->ptmp_mode_) {
+        this->publish_caller_(caller_name);
+      }
 
       if (this->auto_answer_ || no_ring) {
         // Auto-answer ON or NO_RING flag: start streaming immediately
@@ -964,6 +1166,7 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
         this->pending_incoming_call_ = true;  // Mark as incoming call waiting for answer
         this->send_message_(this->client_.socket.load(), MessageType::RING);
         ESP_LOGI(TAG, "Auto-answer OFF - sending RING, waiting for local answer");
+        this->ringing_start_time_ = millis();  // Start ringing timeout timer
         this->publish_state_();  // Publish "Ringing" state
         this->ringing_trigger_.trigger();
       }
@@ -973,6 +1176,10 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
     case MessageType::STOP:
       ESP_LOGI(TAG, "Received STOP from client");
       this->pending_incoming_call_ = false;  // Clear incoming call flag
+      // Clear caller name in PTMP mode
+      if (this->ptmp_mode_) {
+        this->publish_caller_("");
+      }
       this->set_streaming_(false);
       this->set_active_(false);
       this->call_end_trigger_.trigger();

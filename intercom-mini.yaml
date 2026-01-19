@@ -3,7 +3,7 @@
 # ==============================================================================
 #
 # Uses the new intercom_api component with TCP streaming on port 6054.
-# Replaces UDP-based intercom_audio with a more reliable TCP approach.
+# Clean YAML syntax with native platform entities (no lambdas!)
 #
 # HARDWARE:
 #   - Board: ESP32-S3 Mini (4MB Flash, Quad PSRAM)
@@ -30,7 +30,6 @@
 substitutions:
   name: intercom-mini
   friendly_name: Intercom Mini
-  ringing_timeout: "30s"  # Timeout for unanswered calls
 
 esphome:
   name: ${name}
@@ -38,20 +37,6 @@ esphome:
   min_version: 2025.5.0
   platformio_options:
     board_build.flash_mode: dio
-  on_boot:
-    priority: 600
-    then:
-      - lambda: |-
-          // Restore speaker volume from saved state
-          float vol = id(speaker_volume).state / 100.0f;
-          id(intercom).set_volume(vol);
-          // Restore mic gain from saved state (dB)
-          id(intercom).set_mic_gain_db(id(mic_gain).state);
-          // Initialize contacts with Home Assistant as default
-          if (id(contacts).empty()) {
-            id(contacts).push_back("Home Assistant");
-            id(peer_name) = "Home Assistant";
-          }
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -71,6 +56,8 @@ psram:
 # CONNECTIVITY
 # ==============================================================================
 api:
+  on_client_connected:
+    - lambda: 'id(intercom).publish_entity_states();'
 
 ota:
   - platform: esphome
@@ -139,157 +126,145 @@ speaker:
     sample_rate: 16000
     bits_per_sample: 16bit
     timeout: never
-    buffer_duration: 100ms  # ~6 chunks buffer - low latency without underrun
+    buffer_duration: 100ms
 
 # ==============================================================================
-# AEC (Acoustic Echo Cancellation) - ESP-SR
+# AEC (Acoustic Echo Cancellation)
 # ==============================================================================
 esp_aec:
   id: aec_processor
   sample_rate: 16000
-  filter_length: 4          # 4 recommended for ESP32-S3
-  mode: voip_low_cost       # Best for voice intercom
+  filter_length: 4
+  mode: voip_low_cost
 
 # ==============================================================================
 # INTERCOM API (TCP-based, port 6054)
 # ==============================================================================
+# Auto-creates these sensors:
+#   - text_sensor.intercom_mini_intercom_state (Idle/Ringing/Streaming)
+#   - text_sensor.intercom_mini_destination (selected contact) [PTMP only]
+#   - text_sensor.intercom_mini_caller (who is calling) [PTMP only]
+#   - text_sensor.intercom_mini_contacts (count) [PTMP only]
+
 intercom_api:
   id: intercom
+  mode: ptmp                  # Multi-device mode with contacts
   microphone: mic_component
   speaker: spk_component
-  mic_bits: 32              # SPH0645 is 32-bit I2S mic
-  dc_offset_removal: true   # Required for SPH0645 (has DC bias)
-  aec_id: aec_processor     # Link to AEC component
+  mic_bits: 32                # SPH0645 is 32-bit I2S mic
+  dc_offset_removal: true     # Required for SPH0645 (has DC bias)
+  aec_id: aec_processor
+  ringing_timeout: 30s        # Auto-decline if not answered
+
+  on_ringing:
+    - light.turn_on:
+        id: status_led
+        effect: "Ringing"
+        red: 100%
+        green: 0%
+        blue: 0%
+
+  on_streaming:
+    - light.turn_on:
+        id: status_led
+        effect: "None"
+        red: 0%
+        green: 100%
+        blue: 0%
+
+  on_idle:
+    - light.turn_off: status_led
+
+  on_call_end:
+    - logger.log: "Call ended"
 
 # ==============================================================================
-# GLOBALS
+# BUTTONS
 # ==============================================================================
-globals:
-  - id: peer_name
-    type: std::string
-    restore_value: no
-    initial_value: '"Home Assistant"'
-
-  - id: contacts
-    type: std::vector<std::string>
-    restore_value: no
-
-  - id: contact_index
-    type: int
-    restore_value: yes
-    initial_value: '0'
-
-# ==============================================================================
-# SCRIPTS
-# ==============================================================================
-script:
-  # Ringing timeout - returns to Idle if no one answers
-  - id: ringing_timeout_script
-    mode: restart  # Restart if called again (resets timer)
-    then:
-      - logger.log: "Ringing timeout started (${ringing_timeout})"
-      - delay: ${ringing_timeout}
-      - lambda: |-
-          std::string state = id(intercom_state).state;
-          if (state == "Ringing" || state == "Calling") {
-            ESP_LOGI("intercom", "Ringing timeout - returning to Idle");
-            id(intercom).stop();
-            id(peer_name) = "Home Assistant";
-          }
-
-  # Cancel ringing timeout (called when call is answered)
-  - id: stop_ringing_timeout
-    then:
-      - script.stop: ringing_timeout_script
-      - logger.log: "Ringing timeout cancelled"
-
-  # Cycle to next contact
-  - id: next_contact
-    then:
-      - lambda: |-
-          if (id(contacts).empty()) {
-            ESP_LOGW("intercom", "No contacts available");
-            return;
-          }
-          id(contact_index) = (id(contact_index) + 1) % id(contacts).size();
-          id(peer_name) = id(contacts)[id(contact_index)];
-          ESP_LOGI("intercom", "Selected contact: %s", id(peer_name).c_str());
-      - component.update: destination_sensor
-
-  # Cycle to previous contact
-  - id: previous_contact
-    then:
-      - lambda: |-
-          if (id(contacts).empty()) {
-            ESP_LOGW("intercom", "No contacts available");
-            return;
-          }
-          int size = id(contacts).size();
-          id(contact_index) = (id(contact_index) - 1 + size) % size;
-          id(peer_name) = id(contacts)[id(contact_index)];
-          ESP_LOGI("intercom", "Selected contact: %s", id(peer_name).c_str());
-      - component.update: destination_sensor
-
-# ==============================================================================
-# VOLUME & GAIN CONTROL
-# ==============================================================================
-number:
+button:
+  # Smart Call button: handles both HA doorbell and ESP-to-ESP calls
   - platform: template
-    id: speaker_volume
-    name: "Speaker Volume"
-    icon: "mdi:volume-high"
-    min_value: 0
-    max_value: 100
-    step: 5
-    initial_value: 80
-    optimistic: true
-    restore_value: true
-    unit_of_measurement: "%"
-    set_action:
-      - lambda: |-
-          float vol = x / 100.0f;
-          id(intercom).set_volume(vol);
+    id: call_button
+    name: "Call"
+    icon: "mdi:phone"
+    on_press:
+      - if:
+          condition:
+            lambda: 'return strcmp(id(intercom).get_state_str(), "Ringing") == 0;'
+          then:
+            - intercom_api.answer_call:
+                id: intercom
+          else:
+            - if:
+                condition:
+                  lambda: 'return strcmp(id(intercom).get_state_str(), "Streaming") == 0;'
+                then:
+                  - intercom_api.stop:
+                      id: intercom
+                else:
+                  # Idle - check destination
+                  - if:
+                      condition:
+                        lambda: 'return id(intercom).get_current_destination() == "Home Assistant";'
+                      then:
+                        - homeassistant.event:
+                            event: esphome.doorbell_ring
+                            data:
+                              device: "${name}"
+                      else:
+                        - intercom_api.start:
+                            id: intercom
+
+  - platform: intercom_api
+    intercom_api_id: intercom
+    next_contact:
+      id: next_contact_button
+      name: "Next Contact"
+    prev_contact:
+      id: prev_contact_button
+      name: "Previous Contact"
 
   - platform: template
-    id: mic_gain
-    name: "Mic Gain"
-    icon: "mdi:microphone"
-    min_value: -20
-    max_value: 20
-    step: 1
-    initial_value: 0
-    optimistic: true
-    restore_value: true
-    unit_of_measurement: "dB"
-    set_action:
-      - lambda: |-
-          id(intercom).set_mic_gain_db(x);
+    id: refresh_contacts_button
+    name: "Refresh Contacts"
+    icon: "mdi:refresh"
+    entity_category: config
+    on_press:
+      - intercom_api.set_contacts:
+          id: intercom
+          contacts_csv: !lambda 'return id(ha_active_devices).state;'
+
+  - platform: restart
+    name: "Restart"
+    icon: "mdi:restart"
 
 # ==============================================================================
-# SWITCHES
+# SWITCHES (native platform with restore_mode)
 # ==============================================================================
 switch:
-  - platform: template
-    id: aec_switch
-    name: "Echo Cancellation"
-    icon: "mdi:ear-hearing"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    turn_on_action:
-      - lambda: 'id(intercom).set_aec_enabled(true);'
-    turn_off_action:
-      - lambda: 'id(intercom).set_aec_enabled(false);'
+  - platform: intercom_api
+    intercom_api_id: intercom
+    auto_answer:
+      id: auto_answer_switch
+      name: "Auto Answer"
+      restore_mode: RESTORE_DEFAULT_ON
+    aec:
+      id: aec_switch
+      name: "Echo Cancellation"
+      restore_mode: RESTORE_DEFAULT_OFF
 
-  - platform: template
-    id: auto_answer_switch
-    name: "Auto Answer"
-    icon: "mdi:phone-incoming"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-    turn_on_action:
-      - lambda: 'id(intercom).set_auto_answer(true);'
-    turn_off_action:
-      - lambda: 'id(intercom).set_auto_answer(false);'
+# ==============================================================================
+# NUMBERS (native platform with restore_value)
+# ==============================================================================
+number:
+  - platform: intercom_api
+    intercom_api_id: intercom
+    speaker_volume:
+      id: speaker_volume
+      name: "Speaker Volume"
+    mic_gain:
+      id: mic_gain
+      name: "Mic Gain"
 
 # ==============================================================================
 # STATUS LED (WS2812 RGB on GPIO21)
@@ -321,109 +296,17 @@ light:
               duration: 250ms
 
 # ==============================================================================
-# TEXT SENSORS (status)
+# TEXT SENSORS
 # ==============================================================================
 text_sensor:
-  # Subscribe to HA's active devices sensor - automatically updated when devices connect/disconnect
+  # Subscribe to HA's centralized contacts sensor
   - platform: homeassistant
     id: ha_active_devices
     entity_id: sensor.intercom_active_devices
     on_value:
-      then:
-        - lambda: |-
-            // Parse contacts from HA sensor: "Home Assistant,Intercom Mini,Intercom Xiaozhi"
-            // This ESP should NOT appear in its own contacts list
-            id(contacts).clear();
-            std::string data = x;
-            std::string my_name = "${friendly_name}";
-            if (data.empty()) {
-              id(contacts).push_back("Home Assistant");
-            } else {
-              size_t pos;
-              while (!data.empty()) {
-                pos = data.find(',');
-                std::string name = (pos != std::string::npos) ? data.substr(0, pos) : data;
-                // Trim whitespace
-                while (!name.empty() && name[0] == ' ') name.erase(0, 1);
-                while (!name.empty() && name[name.size()-1] == ' ') name.erase(name.size()-1);
-                // Add if not empty and not this device
-                if (!name.empty() && name != my_name) {
-                  id(contacts).push_back(name);
-                }
-                if (pos == std::string::npos) break;
-                data.erase(0, pos + 1);
-              }
-            }
-            // Ensure at least "Home Assistant" is available
-            if (id(contacts).empty()) {
-              id(contacts).push_back("Home Assistant");
-            }
-            // Reset to first contact and update display
-            id(contact_index) = 0;
-            id(peer_name) = id(contacts)[0];
-            id(destination_sensor).update();
-            ESP_LOGI("intercom", "Contacts updated from HA: %d devices", id(contacts).size());
-
-  - platform: intercom_api
-    id: intercom_state
-    name: "Intercom State"
-    intercom_api_id: intercom
-    on_value:
-      then:
-        - if:
-            condition:
-              text_sensor.state:
-                id: intercom_state
-                state: "Ringing"
-            then:
-              - light.turn_on:
-                  id: status_led
-                  effect: "Ringing"
-                  red: 100%
-                  green: 0%
-                  blue: 0%
-              - script.execute: ringing_timeout_script
-        - if:
-            condition:
-              text_sensor.state:
-                id: intercom_state
-                state: "Calling"
-            then:
-              - script.execute: ringing_timeout_script
-        - if:
-            condition:
-              text_sensor.state:
-                id: intercom_state
-                state: "Streaming"
-            then:
-              - light.turn_on:
-                  id: status_led
-                  effect: "None"
-                  red: 0%
-                  green: 100%
-                  blue: 0%
-              - script.execute: stop_ringing_timeout
-        - if:
-            condition:
-              text_sensor.state:
-                id: intercom_state
-                state: "Idle"
-            then:
-              - light.turn_off:
-                  id: status_led
-              - script.execute: stop_ringing_timeout
-              - lambda: 'id(peer_name) = "Home Assistant";'
-
-  # Currently selected destination (from contacts array)
-  - platform: template
-    id: destination_sensor
-    name: "Destination"
-    icon: "mdi:phone-forward"
-    update_interval: never
-    lambda: |-
-      if (id(contacts).empty()) return std::string("Home Assistant");
-      int idx = id(contact_index) % id(contacts).size();
-      return id(contacts)[idx];
+      - intercom_api.set_contacts:
+          id: intercom
+          contacts_csv: !lambda 'return x;'
 
 # ==============================================================================
 # DIAGNOSTICS
@@ -440,109 +323,3 @@ sensor:
   - platform: internal_temperature
     name: "CPU Temperature"
     update_interval: 60s
-
-button:
-  # Call/Answer/Hangup button - uses if/else to prevent automation continuation bugs
-  - platform: template
-    id: call_button
-    name: "Call"
-    icon: "mdi:phone"
-    on_press:
-      - if:
-          condition:
-            text_sensor.state:
-              id: intercom_state
-              state: "Ringing"
-          then:
-            # Incoming call: Answer
-            - lambda: 'id(intercom).answer_call();'
-          else:
-            - if:
-                condition:
-                  or:
-                    - text_sensor.state:
-                        id: intercom_state
-                        state: "Streaming"
-                    - text_sensor.state:
-                        id: intercom_state
-                        state: "Calling"
-                then:
-                  # In call: Hangup
-                  - lambda: 'id(intercom).stop();'
-                else:
-                  # Idle: Start call to Home Assistant
-                  - lambda: 'id(intercom).start();'
-
-  - platform: template
-    id: previous_contact_button
-    name: "Previous Contact"
-    icon: "mdi:account-arrow-left"
-    on_press:
-      - script.execute: previous_contact
-
-  - platform: template
-    id: next_contact_button
-    name: "Next Contact"
-    icon: "mdi:account-arrow-right"
-    on_press:
-      - script.execute: next_contact
-
-  - platform: template
-    id: refresh_contacts_button
-    name: "Refresh Contacts"
-    icon: "mdi:refresh"
-    entity_category: config
-    on_press:
-      - lambda: |-
-          // Force re-read of contacts from HA sensor
-          auto val = id(ha_active_devices).state;
-          if (!val.empty()) {
-            // Manually trigger the same parsing logic
-            id(contacts).clear();
-            std::string data = val;
-            std::string my_name = "${friendly_name}";
-            size_t pos;
-            while (!data.empty()) {
-              pos = data.find(',');
-              std::string name = (pos != std::string::npos) ? data.substr(0, pos) : data;
-              while (!name.empty() && name[0] == ' ') name.erase(0, 1);
-              while (!name.empty() && name[name.size()-1] == ' ') name.erase(name.size()-1);
-              if (!name.empty() && name != my_name) {
-                id(contacts).push_back(name);
-              }
-              if (pos == std::string::npos) break;
-              data.erase(0, pos + 1);
-            }
-            if (id(contacts).empty()) {
-              id(contacts).push_back("Home Assistant");
-            }
-            id(contact_index) = 0;
-            id(peer_name) = id(contacts)[0];
-            id(destination_sensor).update();
-            ESP_LOGI("intercom", "Contacts refreshed: %d devices", id(contacts).size());
-          }
-
-  - platform: restart
-    name: "Restart"
-    icon: "mdi:restart"
-
-# ==============================================================================
-# CONTACTS & CALLER INFO (received from HA)
-# ==============================================================================
-text:
-  - platform: template
-    id: incoming_caller
-    name: "Incoming Caller"
-    mode: text
-    entity_category: config
-    optimistic: true
-    on_value:
-      then:
-        - lambda: |-
-            // Set by HA when someone is calling this device
-            if (!x.empty()) {
-              id(peer_name) = x;
-              ESP_LOGI("intercom", "Incoming call from: %s", x.c_str());
-            }
-
-  # Note: contacts_data text entity removed - contacts now come from sensor.intercom_active_devices

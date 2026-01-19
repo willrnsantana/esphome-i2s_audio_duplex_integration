@@ -5,6 +5,8 @@
 #include "esphome/core/component.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/ring_buffer.h"
+#include "esphome/core/application.h"
+#include "esphome/core/preferences.h"
 
 #ifdef USE_MICROPHONE
 #include "esphome/components/microphone/microphone.h"
@@ -15,6 +17,7 @@
 
 #include "esphome/components/switch/switch.h"
 #include "esphome/components/number/number.h"
+#include "esphome/components/button/button.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 
 #ifdef USE_ESP_AEC
@@ -31,6 +34,7 @@
 #include <atomic>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace esphome {
 namespace intercom_api {
@@ -58,6 +62,9 @@ class IntercomApi : public Component {
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
+  // Call from YAML api: on_client_connected: to publish restored entity states to HA
+  void publish_entity_states();
+
   // Configuration
 #ifdef USE_MICROPHONE
   void set_microphone(microphone::Microphone *mic) { this->microphone_ = mic; }
@@ -67,6 +74,7 @@ class IntercomApi : public Component {
 #endif
   void set_mic_bits(int bits) { this->mic_bits_ = bits; }
   void set_dc_offset_removal(bool enabled) { this->dc_offset_removal_ = enabled; }
+  void set_device_name(const std::string &name) { this->device_name_ = name; }
 
 #ifdef USE_ESP_AEC
   void set_aec(esp_aec::EspAec *aec) { this->aec_ = aec; }
@@ -97,6 +105,12 @@ class IntercomApi : public Component {
                                    !this->client_.streaming.load() &&
                                    this->pending_incoming_call_; }
 
+  // Smart call toggle: ringing → answer, active → hangup, idle → start
+  void call_toggle();
+
+  // Ringing timeout configuration (auto-hangup if not answered)
+  void set_ringing_timeout(uint32_t timeout_ms) { this->ringing_timeout_ms_ = timeout_ms; }
+
   // Mic gain control (dB scale: -20 to +20)
   void set_mic_gain_db(float db);
   float get_mic_gain() const { return this->mic_gain_; }
@@ -109,9 +123,36 @@ class IntercomApi : public Component {
   ConnectionState get_state() const { return this->state_; }
   const char *get_state_str() const;
 
-  // State sensor registration
+  // Mode setting
+  void set_ptmp_mode(bool ptmp) { this->ptmp_mode_ = ptmp; }
+  bool is_ptmp_mode() const { return this->ptmp_mode_; }
+
+  // Sensor registration
   void set_state_sensor(text_sensor::TextSensor *sensor) { this->state_sensor_ = sensor; }
+  void set_destination_sensor(text_sensor::TextSensor *sensor) { this->destination_sensor_ = sensor; }
+  void set_caller_sensor(text_sensor::TextSensor *sensor) { this->caller_sensor_ = sensor; }
+  void set_contacts_sensor(text_sensor::TextSensor *sensor) { this->contacts_sensor_ = sensor; }
+
+  // Entity registration (for state sync after boot)
+  void register_auto_answer_switch(switch_::Switch *sw) { this->auto_answer_switch_ = sw; }
+  void register_volume_number(number::Number *num) { this->volume_number_ = num; }
+  void register_mic_gain_number(number::Number *num) { this->mic_gain_number_ = num; }
+#ifdef USE_ESP_AEC
+  void register_aec_switch(switch_::Switch *sw) { this->aec_switch_ = sw; }
+#endif
+
+  // Publish sensor values
   void publish_state_();
+  void publish_destination_();
+  void publish_caller_(const std::string &caller_name);
+  void publish_contacts_();
+
+  // Contacts management (PTMP only)
+  void set_contacts(const std::string &contacts_csv);
+  void next_contact();
+  void prev_contact();
+  const std::string &get_current_destination() const;
+  std::string get_contacts_csv() const;
 
   // Triggers
   Trigger<> *get_connect_trigger() { return &this->connect_trigger_; }
@@ -119,6 +160,8 @@ class IntercomApi : public Component {
   Trigger<> *get_start_trigger() { return &this->start_trigger_; }
   Trigger<> *get_stop_trigger() { return &this->stop_trigger_; }
   Trigger<> *get_ringing_trigger() { return &this->ringing_trigger_; }
+  Trigger<> *get_streaming_trigger() { return &this->streaming_trigger_; }
+  Trigger<> *get_idle_trigger() { return &this->idle_trigger_; }
   Trigger<> *get_call_end_trigger() { return &this->call_end_trigger_; }
 
  protected:
@@ -161,11 +204,30 @@ class IntercomApi : public Component {
   speaker::Speaker *speaker_{nullptr};
 #endif
 
-  // State
+  // Mode and state
+  bool ptmp_mode_{false};  // P2P (false) or PTMP (true) mode
   std::atomic<bool> active_{false};
   std::atomic<bool> server_running_{false};
   ConnectionState state_{ConnectionState::DISCONNECTED};
+
+  // Sensors (state is always present, others only in PTMP mode)
   text_sensor::TextSensor *state_sensor_{nullptr};
+  text_sensor::TextSensor *destination_sensor_{nullptr};  // PTMP: selected contact
+  text_sensor::TextSensor *caller_sensor_{nullptr};       // PTMP: who is calling
+  text_sensor::TextSensor *contacts_sensor_{nullptr};     // PTMP: CSV of contacts
+
+  // Registered entities (for state sync after boot)
+  switch_::Switch *auto_answer_switch_{nullptr};
+  number::Number *volume_number_{nullptr};
+  number::Number *mic_gain_number_{nullptr};
+#ifdef USE_ESP_AEC
+  switch_::Switch *aec_switch_{nullptr};
+#endif
+
+  // Contacts management (PTMP only)
+  std::vector<std::string> contacts_{"Home Assistant"};  // Default contact
+  size_t contact_index_{0};
+  std::string device_name_;  // This device's friendly name (to exclude from contacts)
 
   // Sockets
   int server_socket_{-1};
@@ -208,6 +270,10 @@ class IntercomApi : public Component {
   // Pending incoming call (waiting for local answer, NOT just stopped streaming)
   bool pending_incoming_call_{false};
 
+  // Ringing timeout (0 = disabled, otherwise auto-hangup after this many ms)
+  uint32_t ringing_timeout_ms_{0};
+  uint32_t ringing_start_time_{0};
+
   // Mic gain (applied before sending to network)
   float mic_gain_{1.0f};
 
@@ -240,10 +306,12 @@ class IntercomApi : public Component {
   Trigger<> start_trigger_;
   Trigger<> stop_trigger_;
   Trigger<> ringing_trigger_;
+  Trigger<> streaming_trigger_;
+  Trigger<> idle_trigger_;
   Trigger<> call_end_trigger_;  // Fires when call ends (hangup, decline, or connection lost)
 };
 
-// Switch for on/off control
+// Switch for on/off control (simple - ESPHome handles restore)
 class IntercomApiSwitch : public switch_::Switch, public Parented<IntercomApi> {
  public:
   void write_state(bool state) override {
@@ -256,7 +324,7 @@ class IntercomApiSwitch : public switch_::Switch, public Parented<IntercomApi> {
   }
 };
 
-// Number for volume control
+// Number for volume control (simple - parent syncs after boot)
 class IntercomApiVolume : public number::Number, public Parented<IntercomApi> {
  public:
   void control(float value) override {
@@ -265,7 +333,7 @@ class IntercomApiVolume : public number::Number, public Parented<IntercomApi> {
   }
 };
 
-// Number for mic gain control (dB scale)
+// Number for mic gain control (dB scale, simple - parent syncs after boot)
 class IntercomApiMicGain : public number::Number, public Parented<IntercomApi> {
  public:
   void control(float value) override {
@@ -274,7 +342,7 @@ class IntercomApiMicGain : public number::Number, public Parented<IntercomApi> {
   }
 };
 
-// Switch for auto-answer control
+// Switch for auto-answer control (simple - parent syncs after boot)
 class IntercomApiAutoAnswer : public switch_::Switch, public Parented<IntercomApi> {
  public:
   void write_state(bool state) override {
@@ -283,15 +351,115 @@ class IntercomApiAutoAnswer : public switch_::Switch, public Parented<IntercomAp
   }
 };
 
-// Text sensor for intercom state (Idle, Ringing, Streaming, etc.)
-class IntercomApiStateSensor : public text_sensor::TextSensor, public Component, public Parented<IntercomApi> {
- public:
-  void setup() override {
-    this->parent_->set_state_sensor(this);
-  }
+// Note: State and Destination sensors are plain TextSensor* created via new_text_sensor()
+// No custom classes needed - the parent IntercomApi just holds pointers to them
 
-  float get_setup_priority() const override { return setup_priority::DATA; }
+// === Actions for YAML automation syntax ===
+// Usage: intercom_api.next_contact:, intercom_api.start:, etc.
+
+template<typename... Ts>
+class NextContactAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  void play(const Ts &...x) override { this->parent_->next_contact(); }
 };
+
+template<typename... Ts>
+class PrevContactAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  void play(const Ts &...x) override { this->parent_->prev_contact(); }
+};
+
+template<typename... Ts>
+class StartAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  void play(const Ts &...x) override { this->parent_->start(); }
+};
+
+template<typename... Ts>
+class StopAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  void play(const Ts &...x) override { this->parent_->stop(); }
+};
+
+template<typename... Ts>
+class AnswerCallAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  void play(const Ts &...x) override { this->parent_->answer_call(); }
+};
+
+template<typename... Ts>
+class DeclineCallAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  void play(const Ts &...x) override { this->parent_->decline_call(); }
+};
+
+// === Parameterized actions ===
+
+template<typename... Ts>
+class SetVolumeAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  TEMPLATABLE_VALUE(float, volume)
+  void play(const Ts &...x) override {
+    this->parent_->set_volume(this->volume_.value(x...));
+  }
+};
+
+template<typename... Ts>
+class SetMicGainDbAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  TEMPLATABLE_VALUE(float, gain_db)
+  void play(const Ts &...x) override {
+    this->parent_->set_mic_gain_db(this->gain_db_.value(x...));
+  }
+};
+
+template<typename... Ts>
+class SetContactsAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  TEMPLATABLE_VALUE(std::string, contacts_csv)
+  void play(const Ts &...x) override {
+    this->parent_->set_contacts(this->contacts_csv_.value(x...));
+  }
+};
+
+template<typename... Ts>
+class CallToggleAction : public Action<Ts...>, public Parented<IntercomApi> {
+ public:
+  void play(const Ts &...x) override { this->parent_->call_toggle(); }
+};
+
+// === Button platform classes ===
+
+// Smart Call button: ringing → answer, active → hangup, idle → start
+class IntercomCallButton : public button::Button, public Parented<IntercomApi> {
+ public:
+  void press_action() override { this->parent_->call_toggle(); }
+};
+
+// Next contact button (PTMP mode)
+class IntercomNextContactButton : public button::Button, public Parented<IntercomApi> {
+ public:
+  void press_action() override { this->parent_->next_contact(); }
+};
+
+// Previous contact button (PTMP mode)
+class IntercomPrevContactButton : public button::Button, public Parented<IntercomApi> {
+ public:
+  void press_action() override { this->parent_->prev_contact(); }
+};
+
+// === Switch platform classes with restore support ===
+
+// AEC switch (only available when USE_ESP_AEC is defined)
+#ifdef USE_ESP_AEC
+class IntercomAecSwitch : public switch_::Switch, public Parented<IntercomApi> {
+ public:
+  void write_state(bool state) override {
+    this->parent_->set_aec_enabled(state);
+    this->publish_state(state);
+  }
+};
+#endif
 
 }  // namespace intercom_api
 }  // namespace esphome

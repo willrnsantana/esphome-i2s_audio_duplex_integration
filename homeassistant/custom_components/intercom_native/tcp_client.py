@@ -138,24 +138,28 @@ class IntercomTcpClient:
         _LOGGER.debug("[TCP#%d] Disconnected (sent=%d recv=%d)",
                       self._instance_id, self._audio_sent, self._audio_recv)
 
-    async def start_stream(self, flags: int = FLAG_NONE) -> str:
+    async def start_stream(self, flags: int = FLAG_NONE, caller_name: str = "") -> str:
         """Start streaming.
 
         Args:
             flags: Message flags (e.g., FLAG_NO_RING for caller in bridge mode)
+            caller_name: Name of caller to send to ESP (for PTMP mode)
 
         Returns:
             "streaming" - ESP accepted, streaming started
             "ringing" - ESP has auto_answer OFF, waiting for local answer
             "error" - Connection or send failed
         """
-        _LOGGER.debug("[TCP#%d] start_stream(flags=0x%02X)", self._instance_id, flags)
+        _LOGGER.debug("[TCP#%d] start_stream(flags=0x%02X, caller=%s)",
+                      self._instance_id, flags, caller_name or "(none)")
 
         if not self._connected:
             if not await self.connect():
                 return "error"
 
-        if not await self._send_message(MSG_START, flags=flags):
+        # Send START with caller_name as payload (for PTMP mode)
+        payload = caller_name.encode("utf-8") if caller_name else b""
+        if not await self._send_message(MSG_START, data=payload, flags=flags):
             return "error"
 
         # Wait briefly for ESP response (PONG=accept, RING=waiting)

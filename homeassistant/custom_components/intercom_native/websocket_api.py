@@ -231,6 +231,7 @@ class BridgeSession:
         bridge_id: str,
         source_device_id: str,
         source_host: str,
+        source_name: str,
         dest_device_id: str,
         dest_host: str,
     ):
@@ -239,6 +240,7 @@ class BridgeSession:
         self.bridge_id = bridge_id
         self.source_device_id = source_device_id
         self.source_host = source_host
+        self.source_name = source_name  # Caller name (sent to dest via TCP protocol)
         self.dest_device_id = dest_device_id
         self.dest_host = dest_host
 
@@ -383,9 +385,9 @@ class BridgeSession:
 
         # Start streaming on both
         # Source (caller) uses NO_RING flag - should never ring, always start streaming
-        # Dest (callee) may ring if auto_answer is OFF
+        # Dest (callee) may ring if auto_answer is OFF, receives caller name via TCP protocol
         source_result = await self._source_client.start_stream(flags=FLAG_NO_RING)
-        dest_result = await self._dest_client.start_stream()
+        dest_result = await self._dest_client.start_stream(caller_name=self.source_name)
 
         if source_result == "error" or dest_result == "error":
             _LOGGER.error("Bridge: failed to start stream")
@@ -767,14 +769,15 @@ async def websocket_bridge(
                 old_session = _sessions.pop(device_id)
                 await old_session.stop()
 
-        # Set incoming_caller only on destination (callee) - source is the caller
-        await _set_incoming_caller(hass, dest_device_id, source_name)
+        # Note: incoming_caller is now sent via TCP protocol (START message payload)
+        # No need to set it via ESPHome API anymore
 
         bridge = BridgeSession(
             hass=hass,
             bridge_id=bridge_id,
             source_device_id=source_device_id,
             source_host=source_host,
+            source_name=source_name,
             dest_device_id=dest_device_id,
             dest_host=dest_host,
         )
