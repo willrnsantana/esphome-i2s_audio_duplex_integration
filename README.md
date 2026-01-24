@@ -1,58 +1,188 @@
 # ESPHome Intercom API
 
-A bidirectional full-duplex audio intercom system for ESP32 devices integrated with Home Assistant.
+A flexible intercom framework for ESP32 devices - from simple doorbell to PBX-like multi-device system.
 
 ![Dashboard Preview](readme-img/dashboard.png)
 
+![Dashboard Demo](readme-img/dashboard.gif)
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Features](#features)
+- [Architecture](#architecture)
+- [Installation](#installation)
+  - [1. Home Assistant Integration](#1-home-assistant-integration)
+  - [2. ESPHome Component](#2-esphome-component)
+  - [3. Lovelace Card](#3-lovelace-card)
+- [Operating Modes](#operating-modes)
+  - [Simple Mode](#simple-mode-browser--esp)
+  - [Full Mode](#full-mode-esp--esp)
+- [Configuration Reference](#configuration-reference)
+- [Entities and Controls](#entities-and-controls)
+- [Call Flow Diagrams](#call-flow-diagrams)
+- [Hardware Support](#hardware-support)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
+
 ## Overview
 
-**Intercom API** is an ESPHome component that enables real-time bidirectional audio streaming between ESP32 devices and Home Assistant. Unlike traditional approaches that require complex WebRTC/go2rtc setups, this component uses a simple TCP protocol that works seamlessly with Home Assistant's existing infrastructure.
+**Intercom API** is a scalable full-duplex ESPHome intercom framework that grows with your needs:
+
+| Use Case | Configuration | Description |
+|----------|---------------|-------------|
+| 🔔 **Simple Doorbell** | 1 ESP + Browser | Ring notification, answer from phone/PC |
+| 🏠 **Home Intercom** | Multiple ESPs | Call between rooms (Kitchen ↔ Bedroom) |
+| 📞 **PBX-like System** | ESPs + Browser + HA | Full intercom network with Home Assistant as a participant |
+
+**Home Assistant acts as the central hub** - it can receive calls (doorbell), make calls to ESPs, and relay calls between devices. All audio flows through HA, enabling remote access without complex NAT/firewall configuration.
+
+```
+                    ┌─────────────────┐
+                    │  Home Assistant │
+                    │   (PBX hub)     │
+                    └────────┬────────┘
+                             │
+          ┌──────────────────┼──────────────────┐
+          │                  │                  │
+          ▼                  ▼                  ▼
+    ┌──────────┐       ┌──────────┐       ┌──────────┐
+    │  ESP #1  │       │  ESP #2  │       │  Browser │
+    │ (Kitchen)│       │ (Bedroom)│       │  (Phone) │
+    └──────────┘       └──────────┘       └──────────┘
+```
 
 ### Why This Project?
 
-This component was born from the interest shown by users of [esphome-intercom](https://github.com/n-IA-hane/esphome-intercom), which remains the best approach for direct ESP-to-ESP communication over the network. However, integrating that system with Home Assistant required go2rtc and WebRTC cards, which made setup and usage frustrating. Additionally, WebRTC often failed in remote access scenarios due to NAT traversal issues - a common problem when trying to use the intercom from outside your home network.
+This component was born from the limitations of [esphome-intercom](https://github.com/n-IA-hane/esphome-intercom), which uses direct ESP-to-ESP UDP communication. That approach works great for local networks but fails in these scenarios:
 
-**Intercom API** takes a different approach:
+- **Remote access**: WebRTC/go2rtc fails through NAT without port forwarding
+- **Complex setup**: Requires go2rtc server, STUN/TURN configuration
+- **Browser limitations**: WebRTC permission and codec issues
+
+**Intercom API** solves these problems:
+
 - Uses ESPHome's native API for control (port 6053)
 - Opens a dedicated TCP socket for audio streaming (port 6054)
-- Similar architecture to how Voice Assistant works in ESPHome
+- **Works remotely** - Audio streams through HA's WebSocket, so Nabu Casa/reverse proxy/VPN all work
 - No WebRTC, no go2rtc, no port forwarding required
-- **Works flawlessly remotely** - Since audio streams through Home Assistant's WebSocket API, remote access via browser or Companion App works out of the box (through Nabu Casa, reverse proxy, or any existing HA remote access setup)
-
-### How It Works
-
-```
-┌─────────────┐         ┌─────────────┐         ┌─────────────┐
-│   Browser   │◄──WS───►│ Home Assist │◄──TCP──►│    ESP32    │
-│  (Card UI)  │         │   (Relay)   │  6054   │  (Intercom) │
-└─────────────┘         └─────────────┘         └─────────────┘
-```
-
-**Audio Flow:**
-1. **Browser → ESP**: Microphone audio captured via Web Audio API (16kHz mono) → WebSocket to HA → TCP to ESP → Speaker output
-2. **ESP → Browser**: Microphone input → TCP to HA → WebSocket event → Scheduled playback in browser
-
-Audio is processed in 16ms chunks on the ESP side and 64ms chunks on the browser side, achieving sub-500ms round-trip latency.
 
 ---
 
 ## Features
 
 - **Full-duplex audio** - Talk and listen simultaneously
+- **Two operating modes**:
+  - **Simple**: Browser ↔ Home Assistant ↔ ESP
+  - **Full**: ESP ↔ Home Assistant ↔ ESP (intercom between devices)
 - **Echo Cancellation (AEC)** - Built-in acoustic echo cancellation using ESP-SR
 - **Auto Answer** - Configurable automatic call acceptance
 - **Volume Control** - Adjustable speaker volume and microphone gain
-- **Status LED** - Visual feedback for call states (idle, ringing, streaming)
-- **Home Assistant Integration** - Custom Lovelace card with device discovery
-- **Multiple Hardware Support** - Works with various I2S microphones and speakers
+- **Contact Management** - Select call destination from discovered devices
+- **Status LED** - Visual feedback for call states
+- **Persistent Settings** - Volume, gain, AEC state saved to flash
+- **Remote Access** - Works through any HA remote access method
+
+---
+
+## Architecture
+
+### System Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              HOME ASSISTANT                                  │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                    intercom_native integration                       │   │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────────┐   │   │
+│  │  │ WebSocket API │  │  TCP Client  │  │  Auto-Bridge (Full Mode) │   │   │
+│  │  │  /start       │  │  Port 6054   │  │  Detects ESP "Outgoing"  │   │   │
+│  │  │  /stop        │  │  Async queue │  │  Starts ESP↔ESP relay    │   │   │
+│  │  │  /audio       │  │  8-slot buff │  │                         │   │   │
+│  │  └──────┬───────┘  └──────┬───────┘  └─────────────────────────┘   │   │
+│  └─────────┼─────────────────┼──────────────────────────────────────────┘   │
+│            │                 │                                               │
+└────────────┼─────────────────┼───────────────────────────────────────────────┘
+             │ WebSocket       │ TCP :6054
+             │ JSON+Base64     │ Binary PCM
+             ▼                 ▼
+┌─────────────────┐    ┌─────────────────┐
+│     Browser     │    │      ESP32      │
+│  ┌───────────┐  │    │  ┌───────────┐  │
+│  │ Lovelace  │  │    │  │ intercom  │  │
+│  │   Card    │  │    │  │   _api    │  │
+│  │           │  │    │  │           │  │
+│  │ AudioWork │  │    │  │ FreeRTOS  │  │
+│  │   let     │  │    │  │  Tasks    │  │
+│  └───────────┘  │    │  └───────────┘  │
+│   getUserMedia  │    │   I2S mic/spk   │
+└─────────────────┘    └─────────────────┘
+```
+
+### Audio Format
+
+| Parameter | Value |
+|-----------|-------|
+| Sample Rate | 16000 Hz |
+| Bit Depth | 16-bit signed PCM |
+| Channels | Mono |
+| ESP Chunk Size | 512 bytes (256 samples = 16ms) |
+| Browser Chunk Size | 2048 bytes (1024 samples = 64ms) |
+| Round-trip Latency | < 500ms |
+
+### TCP Protocol (Port 6054)
+
+```
+Header (4 bytes):
+┌──────────────┬──────────────┬──────────────────────┐
+│ Type (1 byte)│ Flags (1 byte)│ Length (2 bytes LE) │
+└──────────────┴──────────────┴──────────────────────┘
+
+Message Types:
+  0x01 AUDIO  - PCM audio data
+  0x02 START  - Start streaming (includes caller_name, no_ring flag)
+  0x03 STOP   - Stop streaming
+  0x04 PING   - Keep-alive
+  0x05 PONG   - Keep-alive response
+  0x06 ERROR  - Error notification
+```
 
 ---
 
 ## Installation
 
-### 1. ESPHome Component
+### 1. Home Assistant Integration
 
-Add the external component to your ESPHome configuration:
+#### Copy the integration files
+
+```bash
+# From the repository root
+cp -r homeassistant/custom_components/intercom_native /config/custom_components/
+```
+
+#### Add to configuration.yaml
+
+**This step is required!** The integration must be declared in your `configuration.yaml`:
+
+```yaml
+# configuration.yaml
+intercom_native:
+```
+
+That's it - no additional configuration needed. The integration will:
+- Register WebSocket API commands for the card
+- Create `sensor.intercom_active_devices` (lists all intercom ESPs)
+- Auto-detect ESP state changes for Full Mode bridging
+
+#### Restart Home Assistant
+
+After adding the configuration, restart Home Assistant completely.
+
+### 2. ESPHome Component
+
+Add the external component to your ESPHome device configuration:
 
 ```yaml
 external_components:
@@ -64,20 +194,18 @@ external_components:
     path: esphome_components
 ```
 
-Or for local development:
+#### Minimal Configuration (Simple Mode)
 
 ```yaml
-external_components:
-  - source:
-      type: local
-      path: esphome_components
-    components: [intercom_api, esp_aec]
-```
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Default is 10, increased for: TCP server + API + OTA
+      CONFIG_LWIP_MAX_SOCKETS: "16"
 
-### 2. Basic ESPHome Configuration
-
-```yaml
-# I2S Audio setup (example with separate mic/speaker buses)
+# I2S Audio (example with separate mic/speaker)
 i2s_audio:
   - id: i2s_mic_bus
     i2s_lrclk_pin: GPIO3
@@ -95,7 +223,6 @@ microphone:
     pdm: false
     bits_per_sample: 32bit
     sample_rate: 16000
-    channel: left
 
 speaker:
   - platform: i2s_audio
@@ -106,141 +233,527 @@ speaker:
     sample_rate: 16000
     bits_per_sample: 16bit
 
-# Echo Cancellation (optional but recommended)
+# Echo Cancellation (recommended)
 esp_aec:
   id: aec_processor
   sample_rate: 16000
-  filter_length: 4
-  mode: voip_low_cost
+  filter_length: 4       # 64ms tail length
+  mode: voip_low_cost    # Optimized for real-time
 
-# Intercom API component
+# Intercom API - Simple mode (browser only)
 intercom_api:
   id: intercom
+  mode: simple
   microphone: mic_component
   speaker: spk_component
-  aec_id: aec_processor  # Optional: link to AEC component
+  aec_id: aec_processor
 ```
 
-### 3. Home Assistant Integration
+#### Full Configuration (Full Mode with ESP↔ESP)
 
-Copy the custom component to your Home Assistant configuration:
+```yaml
+intercom_api:
+  id: intercom
+  mode: full                  # Enable ESP↔ESP calls
+  microphone: mic_component
+  speaker: spk_component
+  aec_id: aec_processor
+  ringing_timeout: 30s        # Auto-decline unanswered calls
+
+  # FSM event callbacks
+  on_incoming_call:
+    - light.turn_on:
+        id: status_led
+        effect: "Ringing"
+
+  on_outgoing_call:
+    - light.turn_on:
+        id: status_led
+        effect: "Calling"
+
+  on_streaming:
+    - light.turn_on:
+        id: status_led
+        red: 0%
+        green: 100%
+        blue: 0%
+
+  on_idle:
+    - light.turn_off: status_led
+
+# Switches (with restore from flash)
+switch:
+  - platform: intercom_api
+    intercom_api_id: intercom
+    auto_answer:
+      name: "Auto Answer"
+      restore_mode: RESTORE_DEFAULT_OFF
+    aec:
+      name: "Echo Cancellation"
+      restore_mode: RESTORE_DEFAULT_ON
+
+# Volume controls
+number:
+  - platform: intercom_api
+    intercom_api_id: intercom
+    speaker_volume:
+      name: "Speaker Volume"
+    mic_gain:
+      name: "Mic Gain"
+
+# Buttons for manual control
+button:
+  - platform: template
+    name: "Call"
+    on_press:
+      - intercom_api.call_toggle:
+          id: intercom
+
+  - platform: template
+    name: "Next Contact"
+    on_press:
+      - intercom_api.next_contact:
+          id: intercom
+
+# Subscribe to HA's contact list (Full mode)
+text_sensor:
+  - platform: homeassistant
+    id: ha_active_devices
+    entity_id: sensor.intercom_active_devices
+    on_value:
+      - intercom_api.set_contacts:
+          id: intercom
+          contacts_csv: !lambda 'return x;'
+```
+
+### 3. Lovelace Card
+
+#### Copy the card files
 
 ```bash
-# Copy integration
-cp -r homeassistant/custom_components/intercom_native /config/custom_components/
-
-# Copy card files
 cp frontend/www/intercom-card.js /config/www/
 cp frontend/www/intercom-processor.js /config/www/
 ```
 
-Add the card resource to your Lovelace configuration:
+#### Add as Lovelace resource
+
+Go to **Settings → Dashboards → Resources** (or edit `configuration.yaml`):
 
 ```yaml
-# In configuration.yaml or via UI
 lovelace:
   resources:
     - url: /local/intercom-card.js
       type: module
 ```
 
-Restart Home Assistant.
-
-### 4. Add the Card
-
-Add the Intercom Card to your dashboard:
+#### Add the card to your dashboard
 
 ![Card Configuration](readme-img/card-configuration.png)
 
+```yaml
+type: custom:intercom-card
+entity_id: <your_esp_device_id>
+name: Kitchen Intercom
+mode: full  # or 'simple'
+```
+
 The card automatically discovers ESPHome devices with the `intercom_api` component.
 
-> **Important**: Devices must first be added to Home Assistant via the ESPHome integration (autodiscovery or manually) before they appear in the card's device list.
+> **Note**: Devices must be added to Home Assistant via the ESPHome integration before they appear in the card.
 
 ![ESPHome Add Device](readme-img/esphome-add-device.png)
 
 ---
 
-## API Reference
+## Operating Modes
 
-### Component Configuration
+### Simple Mode (Browser ↔ ESP)
+
+In Simple mode, the browser communicates directly with a single ESP device through Home Assistant.
+
+![Browser calling ESP](readme-img/call-from-home-assistant-to-esp.gif)
+
+```
+┌──────────┐         ┌──────────┐         ┌──────────┐
+│  Browser │◄──WS───►│    HA    │◄──TCP──►│   ESP    │
+│          │         │          │  6054   │          │
+└──────────┘         └──────────┘         └──────────┘
+
+Call Flow:
+1. User clicks "Call" in browser
+2. Card sends intercom_native/start to HA
+3. HA opens TCP connection to ESP:6054
+4. HA sends START message (caller="Home Assistant")
+5. ESP enters Ringing state (or auto-answers)
+6. Bidirectional audio streaming begins
+```
+
+**Use Simple mode when:**
+- You only have one intercom device
+- You only need browser-to-ESP communication
+- You want minimal configuration
+
+### Full Mode (ESP ↔ ESP)
+
+In Full mode, ESP devices can call each other through Home Assistant, which acts as an audio relay.
+
+![ESP to ESP call](readme-img/call-between-esp.png)
+
+```
+┌──────────┐                              ┌──────────┐
+│  ESP #1  │◄──────TCP 6054──────┐ ┌─────►│  ESP #2  │
+│ (Kitchen)│                     │ │      │ (Bedroom)│
+└──────────┘                     ▼ ▼      └──────────┘
+                            ┌──────────┐
+                            │    HA    │
+                            │  Bridge  │
+                            │  (relay) │
+                            └──────────┘
+
+Call Flow (ESP #1 calls ESP #2):
+1. User selects "Bedroom" on ESP #1 display/button
+2. User presses Call button → ESP #1 enters "Outgoing" state
+3. HA detects state change via ESPHome API
+4. HA sends START to ESP #2 (caller="Kitchen")
+5. ESP #2 enters "Ringing" state
+6. User answers on ESP #2 (or auto-answer)
+7. HA bridges audio: ESP #1 ↔ HA ↔ ESP #2
+8. Either device can hangup → STOP propagates to both
+```
+
+**Full mode features:**
+- Contact list auto-discovery from HA
+- Next/Previous contact navigation
+- Caller ID display
+- Ringing timeout with auto-decline
+- Bidirectional hangup propagation
+
+### ESP calling Home Assistant (Doorbell)
+
+When an ESP device has "Home Assistant" selected as destination and initiates a call, it fires an event for notifications:
+
+![ESP calling Home Assistant](readme-img/call-from-esp-to-homeassistant.png)
+
+![Destination selector](readme-img/destination-homeassistant.png)
+
+---
+
+## Configuration Reference
+
+### intercom_api Component
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `id` | ID | Required | Component ID for referencing |
+| `id` | ID | Required | Component ID |
+| `mode` | string | `simple` | `simple` (browser only) or `full` (ESP↔ESP) |
 | `microphone` | ID | Required | Reference to microphone component |
 | `speaker` | ID | Required | Reference to speaker component |
+| `aec_id` | ID | - | Reference to esp_aec component |
 | `mic_bits` | int | 16 | Microphone bit depth (16 or 32) |
-| `dc_offset_removal` | bool | false | Enable DC offset removal (for mics like SPH0645) |
-| `aec_id` | ID | - | Optional: Reference to esp_aec component |
+| `dc_offset_removal` | bool | false | Remove DC offset (for mics like SPH0645) |
+| `ringing_timeout` | time | 0s | Auto-decline after timeout (0 = disabled) |
 
-### Runtime Methods
+### Event Callbacks
 
-Control the intercom from lambdas or automations:
+| Callback | Trigger | Use Case |
+|----------|---------|----------|
+| `on_incoming_call` | Received START with ring | Turn on ringing LED/sound |
+| `on_outgoing_call` | User initiated call | Show "Calling..." status |
+| `on_ringing` | Waiting for answer | Blink LED pattern |
+| `on_answered` | Call was answered | Log event |
+| `on_streaming` | Audio streaming active | Solid LED, enable amp |
+| `on_idle` | Call ended | Turn off LED, disable amp |
+| `on_hangup` | Call terminated | Log with reason |
+| `on_call_failed` | Call failed | Show error |
 
-```cpp
-// Start a call (connect to Home Assistant)
-id(intercom).start();
+### Actions
 
-// Stop/hangup the current call
-id(intercom).stop();
+| Action | Description |
+|--------|-------------|
+| `intercom_api.start` | Start outgoing call |
+| `intercom_api.stop` | Hangup current call |
+| `intercom_api.answer_call` | Answer incoming call |
+| `intercom_api.decline_call` | Decline incoming call |
+| `intercom_api.call_toggle` | Smart: idle→call, ringing→answer, streaming→hangup |
+| `intercom_api.next_contact` | Select next contact (Full mode) |
+| `intercom_api.prev_contact` | Select previous contact (Full mode) |
+| `intercom_api.set_contacts` | Update contact list from CSV |
 
-// Answer an incoming call (when auto_answer is OFF)
-id(intercom).answer_call();
+### Conditions
 
-// Set speaker volume (0.0 to 1.0)
-id(intercom).set_volume(0.8);
+| Condition | Returns true when |
+|-----------|-------------------|
+| `intercom_api.is_idle` | State is Idle |
+| `intercom_api.is_ringing` | State is Ringing (incoming) |
+| `intercom_api.is_calling` | State is Outgoing (waiting answer) |
+| `intercom_api.is_in_call` | State is Streaming (active call) |
+| `intercom_api.is_incoming` | Has incoming call |
 
-// Set microphone gain in dB (-20 to +20)
-id(intercom).set_mic_gain_db(6.0);
+### esp_aec Component
 
-// Enable/disable echo cancellation
-id(intercom).set_aec_enabled(true);
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `id` | ID | Required | Component ID |
+| `sample_rate` | int | 16000 | Must match audio sample rate |
+| `filter_length` | int | 4 | Echo tail in frames (4 = 64ms) |
+| `mode` | string | `voip_low_cost` | AEC algorithm mode |
 
-// Enable/disable auto answer
-// NOTE: Default is ON if you don't declare the switch
-id(intercom).set_auto_answer(true);
-```
+**AEC modes:**
+- `voip_low_cost` - Optimized for real-time voice, lower CPU
+- `voip` - Standard VoIP quality
+- `speex` - Speex-based algorithm
 
-### Exposed Entities
+---
 
-The component exposes these entities to Home Assistant:
+## Entities and Controls
+
+### Auto-created Entities (always)
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| `Intercom State` | Text Sensor | Current state: Idle, Ringing, Streaming |
-| `Speaker Volume` | Number | Speaker volume (0-100%) |
-| `Mic Gain` | Number | Microphone gain (-20 to +20 dB) |
-| `Echo Cancellation` | Switch | Enable/disable AEC |
-| `Auto Answer` | Switch | Auto-accept incoming calls |
-| `Call` | Button | Start/answer/hangup calls |
+| `sensor.{name}_intercom_state` | Text Sensor | Current state: Idle, Ringing, Streaming, etc. |
 
-### Auto Answer Behavior
+### Auto-created Entities (Full mode only)
 
-By default, `auto_answer` is **enabled**. This means:
-- When Home Assistant connects, the ESP immediately starts streaming
-- No user interaction required on the ESP side
+| Entity | Type | Description |
+|--------|------|-------------|
+| `sensor.{name}_destination` | Text Sensor | Currently selected contact |
+| `sensor.{name}_caller` | Text Sensor | Who is calling (during incoming call) |
+| `sensor.{name}_contacts` | Text Sensor | Contact count |
 
-If you want the ESP to "ring" and wait for user confirmation:
+### Platform Entities (declared in YAML)
 
-```yaml
-switch:
-  - platform: template
-    id: auto_answer_switch
-    name: "Auto Answer"
-    icon: "mdi:phone-incoming"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF  # Start with auto_answer disabled
-    turn_on_action:
-      - lambda: 'id(intercom).set_auto_answer(true);'
-    turn_off_action:
-      - lambda: 'id(intercom).set_auto_answer(false);'
+| Platform | Entities |
+|----------|----------|
+| `switch` | `auto_answer`, `aec` |
+| `number` | `speaker_volume` (0-100%), `mic_gain` (-20 to +20 dB) |
+| `button` | Call, Next Contact, Prev Contact, Decline (template) |
+
+---
+
+## Call Flow Diagrams
+
+### Simple Mode: Browser calls ESP
+
+```
+  Browser              Home Assistant              ESP
+     │                       │                      │
+     │  WS: start            │                      │
+     │  {host: "esp.local"}  │                      │
+     ├──────────────────────►│                      │
+     │                       │  TCP Connect :6054   │
+     │                       ├─────────────────────►│
+     │                       │                      │
+     │                       │  START {caller:"HA"} │
+     │                       ├─────────────────────►│
+     │                       │                      │ State: Ringing
+     │                       │                      │ (or auto-answer)
+     │                       │  PONG (answered)     │
+     │                       │◄─────────────────────┤
+     │                       │                      │ State: Streaming
+     │  WS: audio (base64)   │  TCP: AUDIO (PCM)    │
+     ├──────────────────────►├─────────────────────►│ → Speaker
+     │                       │                      │
+     │  WS: audio_event      │  TCP: AUDIO (PCM)    │
+     │◄──────────────────────┤◄─────────────────────┤ ← Mic
+     │                       │                      │
+     │  WS: stop             │  TCP: STOP           │
+     ├──────────────────────►├─────────────────────►│
+     │                       │  TCP Close           │ State: Idle
+     │                       │◄────────────────────►│
+```
+
+### Full Mode: ESP calls ESP
+
+```
+  ESP #1 (Caller)        Home Assistant          ESP #2 (Callee)
+     │                         │                       │
+     │ State: "Outgoing"       │                       │
+     │ (user pressed Call)     │                       │
+     ├────ESPHome API─────────►│                       │
+     │                         │  TCP Connect :6054    │
+     │                         ├──────────────────────►│
+     │                         │                       │
+     │                         │  START {caller:"ESP1"}│
+     │                         ├──────────────────────►│
+     │                         │                       │ State: Ringing
+     │  TCP Connect :6054      │                       │
+     │◄────────────────────────┤                       │
+     │                         │                       │
+     │  START {caller:"ESP2"}  │                       │
+     │◄────────────────────────┤                       │
+     │ State: Ringing          │                       │
+     │                         │                       │
+     │                         │  PONG (user answered) │
+     │                         │◄──────────────────────┤
+     │  PONG                   │                       │ State: Streaming
+     │◄────────────────────────┤                       │
+     │ State: Streaming        │                       │
+     │                         │                       │
+     │  AUDIO ─────────────────┼──────────────────────►│ ESP1 mic → ESP2 spk
+     │◄────────────────────────┼─────────────────────── │ ESP2 mic → ESP1 spk
+     │                         │  (Bridge relays)      │
+     │                         │                       │
+     │  STOP (hangup)          │  STOP                 │
+     ├────────────────────────►├──────────────────────►│
+     │ State: Idle             │                       │ State: Idle
 ```
 
 ---
 
-## Example Dashboard
+## Hardware Support
 
-Here's a complete dashboard configuration with two intercom devices:
+### Tested Configurations
+
+| Device | Microphone | Speaker | I2S Mode | Component |
+|--------|------------|---------|----------|-----------|
+| ESP32-S3 Mini | SPH0645 | MAX98357A | Dual bus | `i2s_audio` |
+| Xiaozhi Ball V3 | ES8311 | ES8311 | Single bus | `i2s_audio_duplex` |
+
+### Requirements
+
+- **ESP32-S3** with PSRAM (required for AEC)
+- I2S microphone (INMP441, SPH0645, ES8311, etc.)
+- I2S speaker amplifier (MAX98357A, ES8311, etc.)
+- ESP-IDF framework (not Arduino)
+
+### Single-Bus Codecs (ES8311, ES8388, WM8960)
+
+Many integrated codecs use a single I2S bus for both mic and speaker. Standard ESPHome `i2s_audio` **cannot handle this**. Use the included `i2s_audio_duplex` component:
+
+```yaml
+external_components:
+  - source:
+      type: git
+      url: https://github.com/n-IA-hane/intercom-api
+      ref: main
+    components: [intercom_api, i2s_audio_duplex, esp_aec]
+    path: esphome_components
+
+i2s_audio_duplex:
+  id: i2s_duplex
+  i2s_lrclk_pin: GPIO45
+  i2s_bclk_pin: GPIO9
+  i2s_mclk_pin: GPIO16
+  i2s_din_pin: GPIO10
+  i2s_dout_pin: GPIO8
+  sample_rate: 16000
+
+microphone:
+  - platform: i2s_audio_duplex
+    id: mic_component
+    i2s_audio_duplex_id: i2s_duplex
+
+speaker:
+  - platform: i2s_audio_duplex
+    id: spk_component
+    i2s_audio_duplex_id: i2s_duplex
+```
+
+See the [i2s_audio_duplex README](esphome_components/i2s_audio_duplex/README.md) for detailed configuration.
+
+---
+
+## Troubleshooting
+
+### Card shows "No devices found"
+
+1. Verify `intercom_native:` is in `configuration.yaml`
+2. Restart Home Assistant after adding the integration
+3. Ensure ESP device is connected via ESPHome integration
+4. Check ESP has `intercom_api` component configured
+5. Clear browser cache and reload
+
+### No audio from ESP speaker
+
+1. Check speaker wiring and I2S pin configuration
+2. Verify `speaker_enable` GPIO if your amp has an enable pin
+3. Check volume level (default 80%)
+4. Look for I2S errors in ESP logs
+
+### No audio from browser
+
+1. Check browser microphone permissions
+2. Verify HTTPS (required for getUserMedia)
+3. Check browser console for AudioContext errors
+4. Try a different browser (Chrome recommended)
+
+### Echo or feedback
+
+1. Enable AEC: create `esp_aec` component and link with `aec_id`
+2. Ensure AEC switch is ON in Home Assistant
+3. Reduce speaker volume
+4. Increase physical distance between mic and speaker
+
+### High latency
+
+1. Check WiFi signal strength (should be > -70 dBm)
+2. Verify Home Assistant is not overloaded
+3. Check for network congestion
+4. Reduce ESP log level to `WARN`
+
+### ESP shows "Ringing" but browser doesn't connect
+
+1. Check TCP port 6054 is accessible
+2. Verify no firewall blocking HA→ESP connection
+3. Check Home Assistant logs for connection errors
+4. Try restarting the ESP device
+
+### Full mode: ESP doesn't see other devices
+
+1. Ensure all ESPs use `mode: full`
+2. Verify `sensor.intercom_active_devices` exists in HA
+3. Check ESP subscribes to this sensor via `text_sensor: platform: homeassistant`
+4. Devices must be online and connected to HA
+
+---
+
+## Home Assistant Automation
+
+When an ESP device calls "Home Assistant", it fires an `esphome.intercom_call` event. Use this automation to receive push notifications:
+
+```yaml
+alias: Doorbell Notification
+description: Send push notification when doorbell rings - tap to open intercom
+triggers:
+  - trigger: event
+    event_type: esphome.intercom_call
+conditions: []
+actions:
+  - action: notify.mobile_app_your_phone
+    data:
+      title: "🔔 Incoming Call"
+      message: "📞 {{ trigger.event.data.caller }} is calling..."
+      data:
+        clickAction: /lovelace/intercom
+        channel: doorbell
+        importance: high
+        ttl: 0
+        priority: high
+        actions:
+          - action: URI
+            title: "📱 Open"
+            uri: /lovelace/intercom
+          - action: ANSWER
+            title: "✅ Answer"
+  - action: persistent_notification.create
+    data:
+      title: "🔔 Incoming Call"
+      message: "📞 {{ trigger.event.data.caller }} is calling..."
+      notification_id: intercom_call
+mode: single
+```
+
+**Event data available:**
+- `trigger.event.data.caller` - Device name (e.g., "Intercom Xiaozhi")
+- `trigger.event.data.destination` - Always "Home Assistant"
+- `trigger.event.data.type` - "doorbell"
+
+> **Note**: Replace `notify.mobile_app_your_phone` with your mobile app service and `/lovelace/intercom` with your dashboard URL.
+
+---
+
+## Example Dashboard
 
 ```yaml
 title: Intercom
@@ -254,8 +767,9 @@ views:
       - type: grid
         cards:
           - type: custom:intercom-card
-            entity_id: 862f3e10eb2d2d63160d393d23474fac
+            entity_id: <your_device_id>
             name: Intercom Mini
+            mode: full
           - type: entities
             entities:
               - entity: number.intercom_mini_speaker_volume
@@ -264,11 +778,14 @@ views:
                 name: Mic gain
               - entity: switch.intercom_mini_echo_cancellation
               - entity: switch.intercom_mini_auto_answer
+              - entity: sensor.intercom_mini_contacts
+              - entity: button.intercom_mini_refresh_contacts
       - type: grid
         cards:
           - type: custom:intercom-card
-            name: Intercom
-            entity_id: df18a94e7c6ebcb84b183ac7c081805d
+            entity_id: <your_device_id>
+            name: Intercom Xiaozhi
+            mode: full
           - type: entities
             entities:
               - entity: number.intercom_xiaozhi_speaker_volume
@@ -277,172 +794,38 @@ views:
                 name: Mic gain
               - entity: switch.intercom_xiaozhi_echo_cancellation
               - entity: switch.intercom_xiaozhi_auto_answer
+              - entity: sensor.intercom_xiaozhi_contacts
+              - entity: button.intercom_xiaozhi_refresh_contacts
 ```
 
 ---
 
-## Supported Hardware
+## Example YAML Files
 
-### Tested Configurations
+Complete working examples are provided in the repository:
 
-| Device | Microphone | Speaker | I2S Mode |
-|--------|------------|---------|----------|
-| ESP32-S3 Mini | SPH0645 | MAX98357A | Dual bus (standard `i2s_audio`) |
-| Xiaozhi Ball V3 | ES8311 | ES8311 | Single bus (`i2s_audio_duplex`) |
-
-### Requirements
-
-- ESP32-S3 with PSRAM (recommended for AEC)
-- I2S microphone (INMP441, SPH0645, ES8311, etc.)
-- I2S speaker amplifier (MAX98357A, ES8311, etc.)
+- [`intercom-mini.yaml`](intercom-mini.yaml) - ESP32-S3 Mini with separate I2S (SPH0645 + MAX98357A)
+- [`intercom-xiaozhi.yaml`](intercom-xiaozhi.yaml) - Xiaozhi Ball V3 with ES8311 codec + display
 
 ---
 
-## Single-Bus Audio Codecs (i2s_audio_duplex)
+## Version History
 
-Many integrated audio codecs like **ES8311, ES8388, WM8960** share a single I2S bus for both microphone and speaker. The standard ESPHome `i2s_audio` component **cannot handle this** - it creates separate I2S instances that conflict with each other.
+### v2.0.0 (Current)
 
-**The `i2s_audio_duplex` component solves this problem** by managing both directions on a single I2S controller.
+- Full mode: ESP↔ESP calls through HA bridge
+- Card as pure ESP state mirror (no internal state tracking)
+- Contacts management with auto-discovery
+- Persistent settings (volume, gain, AEC saved to flash)
+- User-friendly ESP logs ("Incoming call from...", "Calling...")
+- Removed legacy button.py platform (use template buttons)
 
-### When You NEED i2s_audio_duplex
+### v1.0.0
 
-| Hardware Setup | Component to Use |
-|----------------|------------------|
-| Separate mic + speaker (INMP441 + MAX98357A) | Standard `i2s_audio` |
-| ES8311 codec (Xiaozhi Ball, AI kits) | **`i2s_audio_duplex`** (required) |
-| ES8388 codec (LyraT boards) | **`i2s_audio_duplex`** (required) |
-| WM8960 codec | **`i2s_audio_duplex`** (required) |
-
-### Example: Dual Bus (Standard i2s_audio)
-
-For devices with separate I2S buses (like ESP32-S3 Mini with INMP441 + MAX98357A):
-
-```yaml
-# Two separate I2S buses - use standard ESPHome components
-i2s_audio:
-  - id: i2s_mic_bus
-    i2s_lrclk_pin: GPIO3
-    i2s_bclk_pin: GPIO2
-  - id: i2s_spk_bus
-    i2s_lrclk_pin: GPIO6
-    i2s_bclk_pin: GPIO7
-
-microphone:
-  - platform: i2s_audio
-    id: mic_component
-    i2s_audio_id: i2s_mic_bus
-    i2s_din_pin: GPIO4
-    # ... other config
-
-speaker:
-  - platform: i2s_audio
-    id: spk_component
-    i2s_audio_id: i2s_spk_bus
-    i2s_dout_pin: GPIO8
-    # ... other config
-```
-
-### Example: Single Bus (i2s_audio_duplex)
-
-For devices with integrated codecs (like Xiaozhi Ball V3 with ES8311):
-
-```yaml
-external_components:
-  - source:
-      type: git
-      url: https://github.com/n-IA-hane/intercom-api
-      ref: main
-    components: [intercom_api, i2s_audio_duplex, esp_aec]
-    path: esphome_components
-
-# Single I2S bus - MUST use i2s_audio_duplex
-i2s_audio_duplex:
-  id: i2s_duplex
-  i2s_lrclk_pin: GPIO45
-  i2s_bclk_pin: GPIO9
-  i2s_mclk_pin: GPIO16    # Many codecs require MCLK!
-  i2s_din_pin: GPIO10     # Mic data (codec → ESP)
-  i2s_dout_pin: GPIO8     # Speaker data (ESP → codec)
-  sample_rate: 16000
-
-# Standard microphone platform (from i2s_audio_duplex)
-microphone:
-  - platform: i2s_audio_duplex
-    id: mic_component
-    i2s_audio_duplex_id: i2s_duplex
-
-# Standard speaker platform (from i2s_audio_duplex)
-speaker:
-  - platform: i2s_audio_duplex
-    id: spk_component
-    i2s_audio_duplex_id: i2s_duplex
-
-# Intercom uses standard mic/speaker interfaces
-intercom_api:
-  id: intercom
-  microphone: mic_component
-  speaker: spk_component
-```
-
-### Future: Voice Assistant Compatibility
-
-The `i2s_audio_duplex` component exposes **standard ESPHome `microphone` and `speaker` platform classes**, the same interfaces used by Voice Assistant. This opens the door to future testing of coexistence between the two components on the same device.
-
-```yaml
-# Theoretical example - untested, may require state management
-voice_assistant:
-  microphone: mic_component
-  speaker: spk_component
-
-intercom_api:
-  microphone: mic_component
-  speaker: spk_component
-```
-
-> **Note**: This is a future development goal, not a currently tested feature.
-
-See the [i2s_audio_duplex README](esphome_components/i2s_audio_duplex/README.md) for detailed configuration options.
-
----
-
-## Roadmap
-
-### Current Version (v2.0)
-- **Simple mode**: Browser ↔ Home Assistant ↔ ESP
-- **Full mode**: ESP ↔ Home Assistant ↔ ESP (bridged audio)
-  - ESP-to-ESP calls through Home Assistant relay
-  - PBX-like intercom functionality
-  - Contact lists and call routing
-
-### Planned Features
-
-**Voice Assistant Integration**
-- Voice commands: "Call kitchen", "Call Home Assistant"
-- Integration with existing Voice Assistant pipelines
-
----
-
-## Troubleshooting
-
-### No audio from ESP
-- Check speaker wiring and I2S pin configuration
-- Verify `speaker_enable` GPIO if your amp has an enable pin
-- Check volume level (default 80%)
-
-### Echo or feedback
-- Enable AEC: `id(intercom).set_aec_enabled(true);`
-- Reduce speaker volume
-- Increase physical distance between mic and speaker
-
-### High latency
-- Ensure good WiFi signal (check `WiFi Signal` sensor)
-- Reduce buffer sizes if acceptable audio quality
-- Check Home Assistant logs for queue overflows
-
-### Card doesn't show devices
-- Verify the ESP has `intercom_api` component with `text_sensor`
-- Check that ESPHome integration is connected in HA
-- Clear browser cache and reload
+- Initial release
+- Simple mode: Browser ↔ HA ↔ ESP
+- AEC support via esp_aec component
+- i2s_audio_duplex for single-bus codecs
 
 ---
 

@@ -47,10 +47,11 @@ esp32:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      # Default is 10, increased for: TCP server + API + OTA + web_server
       CONFIG_LWIP_MAX_SOCKETS: "16"
 
 psram:
-  mode: quad
+  mode: quad    # Mini has quad PSRAM
   speed: 80MHz
 
 # ==============================================================================
@@ -126,8 +127,8 @@ speaker:
     i2s_mode: primary
     sample_rate: 16000
     bits_per_sample: 16bit
-    timeout: never
-    buffer_duration: 100ms
+    timeout: never        # Keep I2S running (avoids clicks on resume)
+    buffer_duration: 100ms  # Low latency buffer for real-time intercom
 
 # ==============================================================================
 # AEC (Acoustic Echo Cancellation)
@@ -135,8 +136,8 @@ speaker:
 esp_aec:
   id: aec_processor
   sample_rate: 16000
-  filter_length: 4
-  mode: voip_low_cost
+  filter_length: 4     # 4 = 64ms tail (good balance of quality vs CPU)
+  mode: voip_low_cost  # Optimized for real-time voice, lower CPU than default
 
 # ==============================================================================
 # INTERCOM API (TCP-based, port 6054)
@@ -149,27 +150,36 @@ esp_aec:
 
 intercom_api:
   id: intercom
-  mode: full                  # Multi-device mode with contacts, ESP↔ESP calls
+  mode: full                  # full = ESP↔ESP calls with contacts, simple = browser only
   microphone: mic_component
   speaker: spk_component
-  mic_bits: 32                # SPH0645 is 32-bit I2S mic
-  dc_offset_removal: true     # Required for SPH0645 (has DC bias)
-  aec_id: aec_processor
-  ringing_timeout: 30s        # Auto-decline if not answered
+  mic_bits: 32                # SPH0645 outputs 32-bit (default 16), data in upper 18 bits
+  dc_offset_removal: true     # SPH0645 has DC bias that must be removed
+  aec_id: aec_processor       # Links to esp_aec for echo cancellation
+  ringing_timeout: 30s        # Auto-decline unanswered calls
 
-  # === New FSM triggers ===
+  # === FSM event callbacks ===
   on_incoming_call:
     - logger.log: "Incoming call"
 
   on_outgoing_call:
-    # ESP-to-ESP bridge is handled automatically by HA detecting state change to "Outgoing"
-    - logger.log: "Outgoing call - HA will auto-start bridge"
     - light.turn_on:
         id: status_led
         effect: "Ringing"
         red: 100%
         green: 50%
         blue: 0%
+    # Fire HA event when calling "Home Assistant" (for notifications/automations)
+    - if:
+        condition:
+          lambda: 'return id(intercom).get_current_destination() == "Home Assistant";'
+        then:
+          - homeassistant.event:
+              event: esphome.intercom_call
+              data:
+                caller: !lambda 'return App.get_friendly_name();'
+                destination: "Home Assistant"
+                type: "doorbell"
 
   on_ringing:
     - light.turn_on:
@@ -207,38 +217,15 @@ intercom_api:
 # BUTTONS
 # ==============================================================================
 button:
-  # Smart Call button: handles both HA doorbell and ESP-to-ESP calls
+  # Smart Call button: idle→call, ringing→answer, streaming→hangup
+  # The on_outgoing_call callback handles the HA event for doorbell notifications
   - platform: template
     id: call_button
     name: "Call"
     icon: "mdi:phone"
     on_press:
-      - if:
-          condition:
-            lambda: 'return strcmp(id(intercom).get_state_str(), "Ringing") == 0;'
-          then:
-            - intercom_api.answer_call:
-                id: intercom
-          else:
-            - if:
-                condition:
-                  lambda: 'return strcmp(id(intercom).get_state_str(), "Streaming") == 0;'
-                then:
-                  - intercom_api.stop:
-                      id: intercom
-                else:
-                  # Idle - check destination
-                  - if:
-                      condition:
-                        lambda: 'return id(intercom).get_current_destination() == "Home Assistant";'
-                      then:
-                        - homeassistant.event:
-                            event: esphome.doorbell_ring
-                            data:
-                              device: "${friendly_name}"
-                      else:
-                        - intercom_api.start:
-                            id: intercom
+      - intercom_api.call_toggle:
+          id: intercom
 
   # Next contact (full mode)
   - platform: template

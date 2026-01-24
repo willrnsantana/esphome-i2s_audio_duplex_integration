@@ -48,12 +48,14 @@ esp32:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      # Default is 10, increased for: TCP server + API + OTA + web_server
       CONFIG_LWIP_MAX_SOCKETS: "16"
     components:
+      # Required for AEC (esp_aec component)
       - espressif/esp-sr^2.3.0
 
 psram:
-  mode: octal
+  mode: octal   # Xiaozhi has octal PSRAM (faster than quad)
   speed: 80MHz
 
 # ==============================================================================
@@ -121,8 +123,8 @@ audio_dac:
 esp_aec:
   id: aec_component
   sample_rate: 16000
-  filter_length: 4
-  mode: voip_low_cost
+  filter_length: 4     # 4 = 64ms tail (good balance of quality vs CPU)
+  mode: voip_low_cost  # Optimized for real-time voice, lower CPU than default
 
 # ==============================================================================
 # I2S AUDIO DUPLEX (single bus for ES8311)
@@ -174,11 +176,11 @@ output:
 
 intercom_api:
   id: intercom
-  mode: full
+  mode: full              # full = ESP↔ESP calls with contacts, simple = browser only
   microphone: mic_component
   speaker: spk_component
-  aec_id: aec_component
-  ringing_timeout: 30s
+  aec_id: aec_component   # Links to esp_aec for echo cancellation
+  ringing_timeout: 30s    # Auto-decline unanswered calls
 
   # === New FSM triggers for clean page switching ===
   on_incoming_call:
