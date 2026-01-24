@@ -6,6 +6,7 @@
 #include "esphome/core/helpers.h"
 #include "esphome/components/microphone/microphone.h"
 #include "../i2s_audio_duplex.h"
+#include <freertos/semphr.h>
 
 namespace esphome {
 namespace i2s_audio_duplex {
@@ -21,8 +22,11 @@ class I2SAudioDuplexMicrophone : public microphone::Microphone,
   // microphone::Microphone interface
   void start() override;
   void stop() override;
+  void loop() override;
 
  protected:
+  SemaphoreHandle_t active_listeners_semaphore_{nullptr};
+
   void on_audio_data_(const uint8_t *data, size_t len);
 };
 
