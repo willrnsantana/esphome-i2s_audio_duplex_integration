@@ -124,7 +124,7 @@ esp_aec:
   id: aec_component
   sample_rate: 16000
   filter_length: 4     # 4 = 64ms tail (good balance of quality vs CPU)
-  mode: voip_low_cost  # Optimized for real-time voice, lower CPU than default
+  mode: voip_high_perf # High performance AEC for better echo cancellation
 
 # ==============================================================================
 # I2S AUDIO DUPLEX (single bus for ES8311)
@@ -137,7 +137,7 @@ i2s_audio_duplex:
   i2s_din_pin: GPIO10
   i2s_dout_pin: GPIO8
   sample_rate: 16000
-  # NOTE: AEC is handled by intercom_api, NOT here (to avoid double processing)
+  aec_id: aec_component   # AEC here for perfect mic/speaker sync (same audio task)
 
 # ==============================================================================
 # MICROPHONE (via duplex platform)
@@ -179,7 +179,7 @@ intercom_api:
   mode: full              # full = ESP↔ESP calls with contacts, simple = browser only
   microphone: mic_component
   speaker: spk_component
-  aec_id: aec_component   # Links to esp_aec for echo cancellation
+  # NOTE: AEC is handled by i2s_audio_duplex for better timing (same audio task)
   ringing_timeout: 30s    # Auto-decline unanswered calls
 
   # === New FSM triggers for clean page switching ===
@@ -369,6 +369,9 @@ switch:
       id: auto_answer_switch
       name: "Auto Answer"
       restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: i2s_audio_duplex
+    i2s_audio_duplex_id: i2s_duplex
     aec:
       id: aec_switch
       name: "Echo Cancellation"

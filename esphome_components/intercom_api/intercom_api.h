@@ -444,7 +444,7 @@ class IntercomApiMicGain : public number::Number, public Parented<IntercomApi> {
   }
 };
 
-// Switch for auto-answer control (simple - parent syncs after boot)
+// Switch for auto-answer control
 class IntercomApiAutoAnswer : public switch_::Switch, public Parented<IntercomApi> {
  public:
   void write_state(bool state) override {

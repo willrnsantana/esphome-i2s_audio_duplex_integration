@@ -231,27 +231,42 @@ void IntercomApi::dump_config() {
 }
 
 void IntercomApi::publish_entity_states() {
-  // Publish REAL internal values to HA (not entity states which may be stale)
+  // Restore switch states using ESPHome's restore_mode mechanism
   // Call this from YAML: api: on_client_connected: - lambda: 'id(intercom).publish_entity_states();'
-  // This ensures HA sees correct values on boot, reconnect, and HA restart
-  ESP_LOGI(TAG, "Publishing entity states to HA (vol=%.0f%%, mic=%.1fdB, auto=%s, aec=%s)",
+
+  // Auto-answer switch: restore state and apply to internal flag
+  if (this->auto_answer_switch_ != nullptr) {
+    auto initial = this->auto_answer_switch_->get_initial_state_with_restore_mode();
+    if (initial.has_value()) {
+      this->auto_answer_ = *initial;
+      this->auto_answer_switch_->publish_state(*initial);
+    }
+  }
+
+#ifdef USE_ESP_AEC
+  // AEC switch: restore state and enable AEC if needed
+  if (this->aec_switch_ != nullptr) {
+    auto initial = this->aec_switch_->get_initial_state_with_restore_mode();
+    if (initial.has_value()) {
+      if (*initial) {
+        this->set_aec_enabled(true);
+      }
+      this->aec_switch_->publish_state(this->aec_enabled_);
+    }
+  }
+#endif
+
+  ESP_LOGI(TAG, "Entity states synced (vol=%.0f%%, mic=%.1fdB, auto=%s, aec=%s)",
            this->volume_ * 100.0f, this->mic_gain_db_,
            this->auto_answer_ ? "ON" : "OFF", this->aec_enabled_ ? "ON" : "OFF");
 
+  // For numbers: publish our internal values (loaded from flash)
   if (this->volume_number_ != nullptr) {
     this->volume_number_->publish_state(this->volume_ * 100.0f);
   }
   if (this->mic_gain_number_ != nullptr) {
     this->mic_gain_number_->publish_state(this->mic_gain_db_);
   }
-  if (this->auto_answer_switch_ != nullptr) {
-    this->auto_answer_switch_->publish_state(this->auto_answer_);
-  }
-#ifdef USE_ESP_AEC
-  if (this->aec_switch_ != nullptr) {
-    this->aec_switch_->publish_state(this->aec_enabled_);
-  }
-#endif
 }
 
 // === Settings persistence ===
@@ -278,27 +293,12 @@ void IntercomApi::load_settings_() {
     this->mic_gain_ = std::pow(10.0f, this->mic_gain_db_ / 20.0f);
     ESP_LOGI(TAG, "Loaded mic_gain: %.1fdB", this->mic_gain_db_);
 
-    // Apply auto_answer
-    this->auto_answer_ = (stored.flags & FLAG_AUTO_ANSWER) != 0;
-    ESP_LOGI(TAG, "Loaded auto_answer: %s", this->auto_answer_ ? "ON" : "OFF");
-
-#ifdef USE_ESP_AEC
-    // Apply AEC (only if AEC is initialized)
-    bool aec_requested = (stored.flags & FLAG_AEC) != 0;
-    if (aec_requested && this->aec_ != nullptr && this->aec_->is_initialized()) {
-      this->aec_enabled_ = true;
-      ESP_LOGI(TAG, "Loaded AEC: ON");
-    } else {
-      this->aec_enabled_ = false;
-      ESP_LOGI(TAG, "Loaded AEC: OFF (requested=%s, available=%s)",
-               aec_requested ? "yes" : "no",
-               (this->aec_ != nullptr && this->aec_->is_initialized()) ? "yes" : "no");
-    }
-#endif
+    // NOTE: auto_answer and AEC are handled by switch restore_mode, not here
+    // This avoids conflicts between two persistence mechanisms
 
     this->suppress_save_ = false;
   } else {
-    ESP_LOGI(TAG, "No saved settings, using defaults (vol=100%%, mic=0dB, auto=ON, aec=OFF)");
+    ESP_LOGI(TAG, "No saved settings, using defaults (vol=100%%, mic=0dB)");
   }
 }
 
@@ -319,15 +319,12 @@ void IntercomApi::save_settings_() {
   stored.version = SETTINGS_VERSION;
   stored.volume_pct = static_cast<uint8_t>(std::lround(this->volume_ * 100.0f));
   stored.mic_gain_db = static_cast<int8_t>(std::lround(this->mic_gain_db_));
+  // NOTE: auto_answer and AEC flags are NOT saved here - handled by switch restore_mode
   stored.flags = 0;
-  if (this->auto_answer_) stored.flags |= FLAG_AUTO_ANSWER;
-#ifdef USE_ESP_AEC
-  if (this->aec_enabled_) stored.flags |= FLAG_AEC;
-#endif
 
   this->settings_pref_.save(&stored);
-  ESP_LOGD(TAG, "Saved settings: vol=%d%%, mic=%ddB, flags=0x%02X",
-           stored.volume_pct, stored.mic_gain_db, stored.flags);
+  ESP_LOGD(TAG, "Saved settings: vol=%d%%, mic=%ddB",
+           stored.volume_pct, stored.mic_gain_db);
 }
 
 void IntercomApi::start() {
@@ -442,7 +439,7 @@ void IntercomApi::set_volume(float volume) {
 void IntercomApi::set_auto_answer(bool enabled) {
   this->auto_answer_ = enabled;
   ESP_LOGI(TAG, "Auto-answer set to %s", enabled ? "ON" : "OFF");
-  this->schedule_save_settings_();
+  // NOTE: persistence handled by switch restore_mode, not save_settings_()
 }
 
 void IntercomApi::set_mic_gain_db(float db) {
@@ -478,7 +475,7 @@ void IntercomApi::set_aec_enabled(bool enabled) {
     this->spk_ref_buffer_->reset();
   }
   ESP_LOGI(TAG, "AEC %s", enabled ? "enabled" : "disabled");
-  this->schedule_save_settings_();
+  // NOTE: persistence handled by switch restore_mode, not save_settings_()
 }
 #endif
 

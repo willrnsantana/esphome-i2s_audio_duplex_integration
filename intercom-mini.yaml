@@ -137,7 +137,7 @@ esp_aec:
   id: aec_processor
   sample_rate: 16000
   filter_length: 4     # 4 = 64ms tail (good balance of quality vs CPU)
-  mode: voip_low_cost  # Optimized for real-time voice, lower CPU than default
+  mode: voip_high_perf # High performance AEC for better echo cancellation
 
 # ==============================================================================
 # INTERCOM API (TCP-based, port 6054)
