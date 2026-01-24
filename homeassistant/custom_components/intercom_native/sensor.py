@@ -48,6 +48,7 @@ class IntercomActiveDevicesSensor(SensorEntity):
         await self._update_active_devices()
 
         # Subscribe to all state changes to detect intercom devices going online/offline
+        # AND to detect when an ESP goes to "Outgoing" state (to auto-start bridge)
         @callback
         def state_change_listener(event):
             """Handle state change events."""
@@ -67,7 +68,20 @@ class IntercomActiveDevicesSensor(SensorEntity):
                 _LOGGER.info("Intercom device availability changed: %s (available=%s)", entity_id, new_available)
                 self.hass.async_create_task(self._update_active_devices())
 
+            # Auto-bridge: detect when ESP goes to "Outgoing" state
+            # This enables button-initiated ESP-to-ESP calls without HA service calls
+            if new_state is not None and new_state.state.lower() == "outgoing":
+                old_value = old_state.state if old_state else None
+                if old_value is None or old_value.lower() != "outgoing":
+                    _LOGGER.info("ESP going Outgoing, triggering auto-bridge: %s", entity_id)
+                    self.hass.async_create_task(self._trigger_auto_bridge(entity_id))
+
         self._unsubscribe = self.hass.bus.async_listen(EVENT_STATE_CHANGED, state_change_listener)
+
+    async def _trigger_auto_bridge(self, intercom_state_entity_id: str) -> None:
+        """Trigger auto-bridge when ESP goes to Outgoing state."""
+        from .websocket_api import start_auto_bridge
+        await start_auto_bridge(self.hass, intercom_state_entity_id)
 
     async def async_will_remove_from_hass(self) -> None:
         """Run when entity is removed from hass."""
@@ -108,7 +122,9 @@ class IntercomActiveDevicesSensor(SensorEntity):
         if new_value != self._attr_native_value:
             self._attr_native_value = new_value
             _LOGGER.info("Active intercom devices updated: %s", new_value)
-            self.async_write_ha_state()
+            # Only write state if entity is fully registered
+            if self.hass and self.entity_id:
+                self.async_write_ha_state()
 
     async def async_update(self) -> None:
         """Update the sensor."""

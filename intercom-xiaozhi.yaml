@@ -60,7 +60,13 @@ psram:
 # ==============================================================================
 api:
   on_client_connected:
-    - lambda: 'id(intercom).publish_entity_states();'
+    - lambda: |-
+        // Only publish once on first HA connection (not on every log viewer connect)
+        static bool published = false;
+        if (!published) {
+          published = true;
+          id(intercom).publish_entity_states();
+        }
 
 ota:
   - platform: esphome
@@ -186,6 +192,18 @@ intercom_api:
         effect: "Calling"
     - display.page.show: page_ringing_out
     - component.update: main_display
+    # Doorbell event for "Home Assistant" destination (for HA automations/notifications)
+    # ESP-to-ESP bridge is handled automatically by HA detecting state change to "Outgoing"
+    - if:
+        condition:
+          lambda: 'return id(intercom).get_current_destination() == "Home Assistant";'
+        then:
+          - homeassistant.event:
+              event: esphome.intercom_call
+              data:
+                caller: !lambda 'return App.get_friendly_name();'
+                destination: "Home Assistant"
+                type: "doorbell"
 
   on_ringing:
     - light.turn_on:
@@ -239,27 +257,43 @@ script:
   - id: update_display_page
     mode: restart
     then:
-      - lambda: |-
-          // Use new FSM states for page switching
-          const char* state = id(intercom).get_call_state_str();
-          if (strcmp(state, "idle") == 0) {
-            id(main_display).show_page(id(page_idle));
-          } else if (strcmp(state, "ringing") == 0 || strcmp(state, "incoming") == 0) {
-            id(main_display).show_page(id(page_ringing_in));
-          } else if (strcmp(state, "streaming") == 0 || strcmp(state, "answering") == 0) {
-            id(main_display).show_page(id(page_in_call));
-          } else if (strcmp(state, "outgoing") == 0) {
-            id(main_display).show_page(id(page_ringing_out));
-          }
+      - if:
+          condition:
+            intercom_api.is_idle:
+              id: intercom
+          then:
+            - display.page.show: page_idle
+          else:
+            - if:
+                condition:
+                  intercom_api.is_incoming:
+                    id: intercom
+                then:
+                  - display.page.show: page_ringing_in
+                else:
+                  - if:
+                      condition:
+                        intercom_api.is_calling:
+                          id: intercom
+                      then:
+                        - display.page.show: page_ringing_out
+                      else:
+                        - if:
+                            condition:
+                              intercom_api.is_in_call:
+                                id: intercom
+                            then:
+                              - display.page.show: page_in_call
       - component.update: main_display
 
 # ==============================================================================
-# DISPLAY UPDATE INTERVAL
+# DISPLAY UPDATE INTERVAL - DISABLED to prevent SPI race condition
+# Display is updated via update_display_page script on state changes
 # ==============================================================================
-interval:
-  - interval: 1s
-    then:
-      - component.update: main_display
+# interval:
+#   - interval: 1s
+#     then:
+#       - component.update: main_display
 
 # ==============================================================================
 # BUTTONS (all template - no hardcoded platform)
@@ -386,10 +420,10 @@ binary_sensor:
     id: node_status
     name: "Status"
 
-  # Main button:
+  # Main button using on_multi_click for proper single/double/triple detection
   #   - Single click: call/answer/hangup (smart button)
-  #   - Double click: decline incoming call
-  #   - Long press (2s+): refresh contacts
+  #   - Double click: next contact (if idle) or decline (if ringing)
+  #   - Triple click: refresh contacts
   - platform: gpio
     pin:
       number: GPIO0
@@ -398,22 +432,43 @@ binary_sensor:
     id: main_button
     name: "Main Button"
     icon: "mdi:gesture-tap-button"
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
     on_multi_click:
-      # Double click: decline
-      - timing:
-          - ON for at most 300ms
-          - OFF for at most 300ms
-          - ON for at most 300ms
-        then:
-          - button.press: decline_button
       # Single click: call/answer/hangup
       - timing:
-          - ON for at most 300ms
+          - ON for 50ms to 500ms
+          - OFF for at least 400ms
         then:
           - button.press: call_button
-      # Long press (2s+): refresh contacts
+      # Double click: next contact or decline
       - timing:
-          - ON for at least 2s
+          - ON for 50ms to 500ms
+          - OFF for 50ms to 400ms
+          - ON for 50ms to 500ms
+          - OFF for at least 400ms
+        then:
+          - if:
+              condition:
+                intercom_api.is_ringing:
+                  id: intercom
+              then:
+                - button.press: decline_button
+              else:
+                - if:
+                    condition:
+                      intercom_api.is_idle:
+                        id: intercom
+                    then:
+                      - button.press: next_contact_button
+      # Triple click: refresh contacts
+      - timing:
+          - ON for 50ms to 500ms
+          - OFF for 50ms to 400ms
+          - ON for 50ms to 500ms
+          - OFF for 50ms to 400ms
+          - ON for 50ms to 500ms
         then:
           - button.press: refresh_contacts_button
 

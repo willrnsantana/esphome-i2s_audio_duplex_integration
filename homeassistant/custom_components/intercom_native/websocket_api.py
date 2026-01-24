@@ -228,6 +228,100 @@ class IntercomSession:
             _LOGGER.debug("ANSWER sent to ESP")
         return result
 
+    async def answer_esp_call(self) -> str:
+        """Answer an ESP-initiated call (ESP called Home Assistant).
+
+        This is for when ESP is in OUTGOING state calling us.
+        We connect and send ANSWER (not START).
+
+        Returns:
+            "streaming" - Answer sent, streaming started
+            "error" - Connection failed
+        """
+        if self._active:
+            return "streaming"
+
+        session = self
+
+        def on_audio(data: bytes) -> None:
+            if not session._active:
+                return
+            session.hass.bus.async_fire(
+                "intercom_audio",
+                {"device_id": session.device_id, "audio": base64.b64encode(data).decode("ascii")}
+            )
+
+        def on_disconnected() -> None:
+            session._active = False
+            session.hass.bus.async_fire(
+                "intercom_state", {"device_id": session.device_id, "state": "disconnected"}
+            )
+
+        def on_ringing() -> None:
+            pass  # Not expected in this flow
+
+        def on_answered() -> None:
+            # ESP confirmed our ANSWER with PONG
+            session._active = True
+            session._tx_task = asyncio.create_task(session._tx_sender())
+            session.hass.bus.async_fire(
+                "intercom_state", {"device_id": session.device_id, "state": "streaming"}
+            )
+
+        def on_stop_received() -> None:
+            _LOGGER.info("Session received STOP from ESP: %s", session.device_id)
+            session._active = False
+            session.hass.bus.async_fire(
+                "intercom_state", {"device_id": session.device_id, "state": "idle"}
+            )
+
+        def on_error_received(code: int) -> None:
+            _LOGGER.info("Session received ERROR (code=%d): %s", code, session.device_id)
+            session._active = False
+            session.hass.bus.async_fire(
+                "intercom_state", {"device_id": session.device_id, "state": "idle"}
+            )
+
+        self._tcp_client = IntercomTcpClient(
+            host=self.host,
+            port=INTERCOM_PORT,
+            on_audio=on_audio,
+            on_disconnected=on_disconnected,
+            on_ringing=on_ringing,
+            on_answered=on_answered,
+            on_stop_received=on_stop_received,
+            on_error_received=on_error_received,
+        )
+
+        if not await self._tcp_client.connect():
+            return "error"
+
+        # Send ANSWER directly (not via send_answer which checks _ringing)
+        # We're answering an ESP-initiated call - _ringing is not set because
+        # this is a fresh TCP connection to an ESP that called us
+        from .const import MSG_ANSWER
+        result = await self._tcp_client._send_message(MSG_ANSWER)
+        if result:
+            # Mark that we're awaiting PONG as answer confirmation
+            self._tcp_client._awaiting_answer_ack = True
+
+            # Wait briefly for PONG from ESP
+            for _ in range(50):  # 500ms max wait
+                await asyncio.sleep(0.01)
+                if self._active:
+                    _LOGGER.debug("answer_esp_call: PONG received, streaming")
+                    return "streaming"
+
+            # Timeout - start streaming anyway (ESP might not send PONG)
+            _LOGGER.warning("answer_esp_call: no PONG, assuming stream started")
+            self._tcp_client._awaiting_answer_ack = False
+            self._active = True
+            self._tx_task = asyncio.create_task(self._tx_sender())
+            return "streaming"
+        else:
+            await self._tcp_client.disconnect()
+            return "error"
+
     async def _tx_sender(self) -> None:
         """Single task that sends audio from queue to TCP."""
         try:
@@ -530,6 +624,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, websocket_start)
     websocket_api.async_register_command(hass, websocket_stop)
     websocket_api.async_register_command(hass, websocket_answer)
+    websocket_api.async_register_command(hass, websocket_answer_esp_call)
     websocket_api.async_register_command(hass, websocket_audio)
     websocket_api.async_register_command(hass, websocket_list_devices)
     websocket_api.async_register_command(hass, websocket_bridge)
@@ -594,16 +689,40 @@ async def websocket_stop(
     connection: websocket_api.ActiveConnection,
     msg: Dict[str, Any],
 ) -> None:
-    """Stop intercom session."""
+    """Stop intercom session or bridge involving this device."""
     device_id = msg["device_id"]
     msg_id = msg["id"]
+    stopped = False
 
+    _LOGGER.info("websocket_stop called: device_id=%s", device_id)
+    _LOGGER.info("  Active sessions: %s", list(_sessions.keys()))
+    _LOGGER.info("  Active bridges: %s", list(_bridges.keys()))
+    for bid, b in _bridges.items():
+        _LOGGER.info("    Bridge %s: source=%s dest=%s active=%s",
+                     bid, b.source_device_id, b.dest_device_id, b._active)
+
+    # Stop P2P session if exists
     session = _sessions.pop(device_id, None)
     if session:
         await session.stop()
-        _LOGGER.debug("Session stopped: %s", device_id)
+        _LOGGER.info("Session stopped: %s", device_id)
+        stopped = True
 
-    connection.send_result(msg_id, {"success": True})
+    # Also stop any bridges involving this device (for callee hangup)
+    bridges_to_stop = []
+    for bridge_id, bridge in list(_bridges.items()):
+        if bridge.source_device_id == device_id or bridge.dest_device_id == device_id:
+            bridges_to_stop.append(bridge_id)
+            _LOGGER.info("  Found matching bridge: %s", bridge_id)
+
+    for bridge_id in bridges_to_stop:
+        bridge = _bridges.pop(bridge_id, None)
+        if bridge:
+            await bridge.stop()
+            _LOGGER.info("Bridge stopped via stop command: %s (device: %s)", bridge_id, device_id)
+            stopped = True
+
+    connection.send_result(msg_id, {"success": True, "stopped": stopped})
 
 
 @websocket_api.websocket_command(
@@ -643,6 +762,54 @@ async def websocket_answer(
             return
 
     connection.send_error(msg_id, "not_found", f"No session or bridge for {device_id}")
+
+
+WS_TYPE_ANSWER_ESP_CALL = f"{DOMAIN}/answer_esp_call"
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): WS_TYPE_ANSWER_ESP_CALL,
+        vol.Required("device_id"): str,
+        vol.Required("host"): str,
+    }
+)
+@websocket_api.async_response
+async def websocket_answer_esp_call(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: Dict[str, Any],
+) -> None:
+    """Answer an ESP-initiated call to Home Assistant.
+
+    Used when ESP called us (ESP in OUTGOING state) and we want to answer.
+    Creates session, connects, sends ANSWER (not START).
+    """
+    device_id = msg["device_id"]
+    host = msg["host"]
+    msg_id = msg["id"]
+
+    _LOGGER.debug("Answer ESP call: device=%s host=%s", device_id, host)
+
+    try:
+        # Stop existing session if any
+        if device_id in _sessions:
+            old_session = _sessions.pop(device_id)
+            await old_session.stop()
+
+        session = IntercomSession(hass=hass, device_id=device_id, host=host)
+        result = await session.answer_esp_call()
+
+        if result == "streaming":
+            _sessions[device_id] = session
+            _LOGGER.info("Answered ESP call (streaming): %s", device_id)
+            connection.send_result(msg_id, {"success": True, "state": "streaming"})
+        else:
+            _LOGGER.error("Failed to answer ESP call: %s", device_id)
+            connection.send_error(msg_id, "connection_failed", f"Failed to connect to {host}")
+    except Exception as err:
+        _LOGGER.exception("Answer ESP call exception: %s", err)
+        connection.send_error(msg_id, "exception", str(err))
 
 
 @websocket_api.websocket_command(
@@ -753,7 +920,9 @@ async def _get_intercom_devices(hass: HomeAssistant) -> list:
                     entities["previous"] = eid
                 elif eid.startswith("button.") and "next" in eid and "next" not in entities:
                     entities["next"] = eid
-                elif eid.startswith("button.") and "call" in eid and "call" not in entities:
+                elif eid.startswith("button.") and "decline" in eid and "decline" not in entities:
+                    entities["decline"] = eid
+                elif eid.startswith("button.") and "call" in eid and "decline" not in eid and "call" not in entities:
                     entities["call"] = eid
 
             devices.append({
@@ -828,17 +997,22 @@ async def websocket_bridge(
             dest_name=dest_name,
         )
 
+        # Add to _bridges BEFORE start() to prevent auto-bridge race condition
+        # Auto-bridge checks _bridges and will skip if already exists
+        _bridges[bridge_id] = bridge
+
         result = await bridge.start()
 
-        # Both "connected" and "ringing" are valid states - save the bridge
+        # Both "connected" and "ringing" are valid states - keep the bridge
         if result in ("connected", "ringing"):
-            _bridges[bridge_id] = bridge
             connection.send_result(msg_id, {
                 "success": True,
                 "bridge_id": bridge_id,
                 "state": result  # Let card know if ringing
             })
         else:
+            # Remove from _bridges if start failed
+            _bridges.pop(bridge_id, None)
             connection.send_error(msg_id, "bridge_failed", "Failed to establish bridge")
 
     except Exception as err:
@@ -884,10 +1058,15 @@ async def websocket_bridge_stop(
     bridge_id = msg["bridge_id"]
     msg_id = msg["id"]
 
+    _LOGGER.info("bridge_stop called: bridge_id=%s", bridge_id)
+    _LOGGER.info("  Active bridges: %s", list(_bridges.keys()))
+
     bridge = _bridges.pop(bridge_id, None)
     if bridge:
         await bridge.stop()
-        _LOGGER.debug("Bridge stopped: %s", bridge_id)
+        _LOGGER.info("Bridge stopped via bridge_stop: %s", bridge_id)
+    else:
+        _LOGGER.warning("bridge_stop: bridge not found: %s", bridge_id)
 
     connection.send_result(msg_id, {"success": True})
 
@@ -917,6 +1096,11 @@ async def websocket_decline(
     stopped = False
 
     _LOGGER.info("Decline request for device: %s", device_id)
+    _LOGGER.info("  Active sessions: %s", list(_sessions.keys()))
+    _LOGGER.info("  Active bridges: %s", list(_bridges.keys()))
+    for bid, b in _bridges.items():
+        _LOGGER.info("    Bridge %s: source=%s dest=%s active=%s",
+                     bid, b.source_device_id, b.dest_device_id, b._active)
 
     # Check P2P sessions first
     session = _sessions.pop(device_id, None)
@@ -930,6 +1114,7 @@ async def websocket_decline(
     for bridge_id, bridge in list(_bridges.items()):
         if bridge.source_device_id == device_id or bridge.dest_device_id == device_id:
             bridges_to_stop.append(bridge_id)
+            _LOGGER.info("  Found matching bridge to decline: %s", bridge_id)
 
     for bridge_id in bridges_to_stop:
         bridge = _bridges.pop(bridge_id, None)
@@ -939,3 +1124,160 @@ async def websocket_decline(
             stopped = True
 
     connection.send_result(msg_id, {"success": True, "stopped": stopped})
+
+
+async def start_auto_bridge(hass: HomeAssistant, intercom_state_entity_id: str) -> None:
+    """Auto-start bridge when ESP goes to 'calling' state.
+
+    Called from __init__.py when an ESP's intercom_state changes to 'calling'.
+    This enables ESP button-initiated calls without needing the card.
+    """
+    from homeassistant.helpers import entity_registry as er
+    from homeassistant.helpers import device_registry as dr
+
+    _LOGGER.info("Auto-bridge: processing call from %s", intercom_state_entity_id)
+
+    entity_registry = er.async_get(hass)
+    device_registry = dr.async_get(hass)
+
+    # Find the device that owns this intercom_state sensor
+    source_entity = entity_registry.async_get(intercom_state_entity_id)
+    if not source_entity or not source_entity.device_id:
+        _LOGGER.warning("Auto-bridge: could not find device for %s", intercom_state_entity_id)
+        return
+
+    source_device_id = source_entity.device_id
+    source_device = device_registry.async_get(source_device_id)
+    if not source_device:
+        _LOGGER.warning("Auto-bridge: device not found: %s", source_device_id)
+        return
+
+    # Get source device name and IP
+    source_name = source_device.name or "Unknown"
+    source_host = None
+    for conn_type, conn_value in source_device.connections:
+        if 'ip' in conn_type.lower() or conn_type == 'network_ip':
+            source_host = conn_value
+            break
+    if not source_host:
+        for entry_id in source_device.config_entries:
+            entry = hass.config_entries.async_get_entry(entry_id)
+            if entry and entry.domain == "esphome":
+                source_host = entry.data.get("host")
+                break
+
+    if not source_host:
+        _LOGGER.warning("Auto-bridge: no IP found for source device %s", source_name)
+        return
+
+    # Find destination sensor for this device (sensor.XXX_dest or sensor.XXX_destination)
+    dest_entity_id = None
+    destination_name = None
+    for entity in entity_registry.entities.values():
+        if entity.device_id == source_device_id:
+            if "destination" in entity.entity_id or "_dest" in entity.entity_id:
+                dest_entity_id = entity.entity_id
+                break
+
+    if dest_entity_id:
+        dest_state = hass.states.get(dest_entity_id)
+        if dest_state:
+            destination_name = dest_state.state
+            _LOGGER.info("Auto-bridge: source=%s destination=%s", source_name, destination_name)
+
+    if not destination_name or destination_name.lower() in ("unknown", "", "none"):
+        _LOGGER.warning("Auto-bridge: no valid destination for %s", source_name)
+        return
+
+    # Special case: "Home Assistant" destination means browser call, not ESP bridge
+    if destination_name.lower() == "home assistant":
+        _LOGGER.info("Auto-bridge: destination is 'Home Assistant' - this requires card/browser, skipping auto-bridge")
+        return
+
+    # Find destination device by name
+    dest_device = None
+    dest_device_id = None
+    dest_host = None
+    dest_name = destination_name
+
+    # Search through all devices for one matching the destination name
+    for device in device_registry.devices.values():
+        if device.name and device.name.lower() == destination_name.lower():
+            dest_device = device
+            dest_device_id = device.id
+            break
+
+    if not dest_device:
+        _LOGGER.warning("Auto-bridge: destination device '%s' not found", destination_name)
+        return
+
+    # Get destination IP
+    for conn_type, conn_value in dest_device.connections:
+        if 'ip' in conn_type.lower() or conn_type == 'network_ip':
+            dest_host = conn_value
+            break
+    if not dest_host:
+        for entry_id in dest_device.config_entries:
+            entry = hass.config_entries.async_get_entry(entry_id)
+            if entry and entry.domain == "esphome":
+                dest_host = entry.data.get("host")
+                break
+
+    if not dest_host:
+        _LOGGER.warning("Auto-bridge: no IP found for destination device %s", dest_name)
+        return
+
+    # Check if bridge already exists (being set up or active)
+    # Don't create duplicate - websocket_bridge adds to _bridges BEFORE start()
+    bridge_id = f"{source_device_id}_{dest_device_id}"
+    if bridge_id in _bridges:
+        _LOGGER.debug("Auto-bridge: bridge already exists, skipping: %s", bridge_id)
+        return
+
+    _LOGGER.info(
+        "Auto-bridge: starting bridge %s (%s) <-> %s (%s)",
+        source_name, source_host, dest_name, dest_host
+    )
+
+    # Stop any existing sessions for these devices
+    for device_id in [source_device_id, dest_device_id]:
+        if device_id in _sessions:
+            old_session = _sessions.pop(device_id)
+            await old_session.stop()
+
+    # Stop any existing bridges involving these devices
+    bridges_to_stop = []
+    for bid, bridge in list(_bridges.items()):
+        if bridge.source_device_id in [source_device_id, dest_device_id] or \
+           bridge.dest_device_id in [source_device_id, dest_device_id]:
+            bridges_to_stop.append(bid)
+
+    for bid in bridges_to_stop:
+        old_bridge = _bridges.pop(bid, None)
+        if old_bridge:
+            _LOGGER.debug("Auto-bridge: stopping old bridge: %s", bid)
+            await old_bridge.stop()
+
+    # Create and start the bridge
+    bridge = BridgeSession(
+        hass=hass,
+        bridge_id=bridge_id,
+        source_device_id=source_device_id,
+        source_host=source_host,
+        source_name=source_name,
+        dest_device_id=dest_device_id,
+        dest_host=dest_host,
+        dest_name=dest_name,
+    )
+
+    # Add to _bridges BEFORE start() to prevent race conditions
+    _bridges[bridge_id] = bridge
+
+    result = await bridge.start()
+
+    if result in ("connected", "ringing"):
+        _LOGGER.info("Auto-bridge: started successfully (state=%s)", result)
+    else:
+        # Remove from _bridges if start failed
+        _bridges.pop(bridge_id, None)
+        _LOGGER.error("Auto-bridge: failed to start bridge")

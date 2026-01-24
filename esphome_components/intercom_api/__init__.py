@@ -67,6 +67,15 @@ SetVolumeAction = intercom_api_ns.class_("SetVolumeAction", automation.Action)
 SetMicGainDbAction = intercom_api_ns.class_("SetMicGainDbAction", automation.Action)
 SetContactsAction = intercom_api_ns.class_("SetContactsAction", automation.Action)
 
+# === Condition classes (for YAML: intercom_api.is_idle, etc.) ===
+IntercomIsIdleCondition = intercom_api_ns.class_("IntercomIsIdleCondition", automation.Condition)
+IntercomIsRingingCondition = intercom_api_ns.class_("IntercomIsRingingCondition", automation.Condition)
+IntercomIsStreamingCondition = intercom_api_ns.class_("IntercomIsStreamingCondition", automation.Condition)
+IntercomIsCallingCondition = intercom_api_ns.class_("IntercomIsCallingCondition", automation.Condition)
+IntercomIsIncomingCondition = intercom_api_ns.class_("IntercomIsIncomingCondition", automation.Condition)
+IntercomIsAnsweringCondition = intercom_api_ns.class_("IntercomIsAnsweringCondition", automation.Condition)
+IntercomIsInCallCondition = intercom_api_ns.class_("IntercomIsInCallCondition", automation.Condition)
+
 def _aec_schema(value):
     """Validate aec_id - import esp_aec only if used."""
     if value is None:
@@ -375,4 +384,83 @@ async def set_contacts_action_to_code(config, action_id, template_arg, args):
     cg.add(var.set_parent(parent))
     templ = await cg.templatable(config[CONF_CONTACTS_CSV], args, cg.std_string)
     cg.add(var.set_contacts_csv(templ))
+    return var
+
+
+# === Condition registrations ===
+# Simple condition schema that just references the intercom_api component
+INTERCOM_CONDITION_SCHEMA = automation.maybe_simple_id(
+    {
+        cv.GenerateID(): cv.use_id(IntercomApi),
+    }
+)
+
+
+@automation.register_condition(
+    "intercom_api.is_idle", IntercomIsIdleCondition, INTERCOM_CONDITION_SCHEMA
+)
+async def intercom_is_idle_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    parent = await cg.get_variable(config[CONF_ID])
+    cg.add(var.set_parent(parent))
+    return var
+
+
+@automation.register_condition(
+    "intercom_api.is_ringing", IntercomIsRingingCondition, INTERCOM_CONDITION_SCHEMA
+)
+async def intercom_is_ringing_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    parent = await cg.get_variable(config[CONF_ID])
+    cg.add(var.set_parent(parent))
+    return var
+
+
+@automation.register_condition(
+    "intercom_api.is_streaming", IntercomIsStreamingCondition, INTERCOM_CONDITION_SCHEMA
+)
+async def intercom_is_streaming_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    parent = await cg.get_variable(config[CONF_ID])
+    cg.add(var.set_parent(parent))
+    return var
+
+
+@automation.register_condition(
+    "intercom_api.is_calling", IntercomIsCallingCondition, INTERCOM_CONDITION_SCHEMA
+)
+async def intercom_is_calling_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    parent = await cg.get_variable(config[CONF_ID])
+    cg.add(var.set_parent(parent))
+    return var
+
+
+@automation.register_condition(
+    "intercom_api.is_incoming", IntercomIsIncomingCondition, INTERCOM_CONDITION_SCHEMA
+)
+async def intercom_is_incoming_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    parent = await cg.get_variable(config[CONF_ID])
+    cg.add(var.set_parent(parent))
+    return var
+
+
+@automation.register_condition(
+    "intercom_api.is_answering", IntercomIsAnsweringCondition, INTERCOM_CONDITION_SCHEMA
+)
+async def intercom_is_answering_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    parent = await cg.get_variable(config[CONF_ID])
+    cg.add(var.set_parent(parent))
+    return var
+
+
+@automation.register_condition(
+    "intercom_api.is_in_call", IntercomIsInCallCondition, INTERCOM_CONDITION_SCHEMA
+)
+async def intercom_is_in_call_to_code(config, condition_id, template_arg, args):
+    var = cg.new_Pvariable(condition_id, template_arg)
+    parent = await cg.get_variable(config[CONF_ID])
+    cg.add(var.set_parent(parent))
     return var

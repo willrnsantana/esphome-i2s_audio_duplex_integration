@@ -134,7 +134,12 @@ class IntercomApi : public Component {
   // Runtime control
   void start();
   void stop();
-  bool is_active() const { return this->active_.load(std::memory_order_acquire); }
+  bool is_active() const {
+    // Use FSM state instead of atomic flag for more accurate state
+    return this->call_state_ == CallState::STREAMING ||
+           this->call_state_ == CallState::ANSWERING ||
+           this->call_state_ == CallState::OUTGOING;
+  }
   bool is_connected() const { return this->state_ == ConnectionState::CONNECTED ||
                                      this->state_ == ConnectionState::STREAMING; }
 
@@ -153,6 +158,8 @@ class IntercomApi : public Component {
                                    this->client_.socket.load() >= 0 &&
                                    !this->client_.streaming.load() &&
                                    this->pending_incoming_call_; }
+  bool is_idle() const { return this->call_state_ == CallState::IDLE; }
+  bool is_streaming() const { return this->call_state_ == CallState::STREAMING; }
 
   // Smart call toggle: ringing → answer, active → hangup, idle → start
   void call_toggle();
@@ -336,9 +343,10 @@ class IntercomApi : public Component {
   // Pending incoming call (waiting for local answer, NOT just stopped streaming)
   bool pending_incoming_call_{false};
 
-  // Ringing timeout (0 = disabled, otherwise auto-hangup after this many ms)
+  // Call timeout (0 = disabled, otherwise auto-hangup after this many ms)
   uint32_t ringing_timeout_ms_{0};
   uint32_t ringing_start_time_{0};
+  uint32_t outgoing_start_time_{0};
 
   // Mic gain (applied before sending to network)
   float mic_gain_{1.0f};
@@ -535,6 +543,60 @@ class IntercomAecSwitch : public switch_::Switch, public Parented<IntercomApi> {
   }
 };
 #endif
+
+// === Condition classes for ESPHome automation ===
+
+template<typename... Ts>
+class IntercomIsIdleCondition : public Condition<Ts...>, public Parented<IntercomApi> {
+ public:
+  bool check(const Ts &...x) override { return this->parent_->is_idle(); }
+};
+
+template<typename... Ts>
+class IntercomIsRingingCondition : public Condition<Ts...>, public Parented<IntercomApi> {
+ public:
+  bool check(const Ts &...x) override { return this->parent_->is_ringing(); }
+};
+
+template<typename... Ts>
+class IntercomIsStreamingCondition : public Condition<Ts...>, public Parented<IntercomApi> {
+ public:
+  bool check(const Ts &...x) override { return this->parent_->is_streaming(); }
+};
+
+template<typename... Ts>
+class IntercomIsCallingCondition : public Condition<Ts...>, public Parented<IntercomApi> {
+ public:
+  bool check(const Ts &...x) override {
+    return this->parent_->get_call_state() == CallState::OUTGOING;
+  }
+};
+
+template<typename... Ts>
+class IntercomIsIncomingCondition : public Condition<Ts...>, public Parented<IntercomApi> {
+ public:
+  bool check(const Ts &...x) override {
+    auto state = this->parent_->get_call_state();
+    return state == CallState::INCOMING || state == CallState::RINGING;
+  }
+};
+
+template<typename... Ts>
+class IntercomIsAnsweringCondition : public Condition<Ts...>, public Parented<IntercomApi> {
+ public:
+  bool check(const Ts &...x) override {
+    return this->parent_->get_call_state() == CallState::ANSWERING;
+  }
+};
+
+template<typename... Ts>
+class IntercomIsInCallCondition : public Condition<Ts...>, public Parented<IntercomApi> {
+ public:
+  bool check(const Ts &...x) override {
+    auto state = this->parent_->get_call_state();
+    return state == CallState::STREAMING || state == CallState::ANSWERING;
+  }
+};
 
 }  // namespace intercom_api
 }  // namespace esphome

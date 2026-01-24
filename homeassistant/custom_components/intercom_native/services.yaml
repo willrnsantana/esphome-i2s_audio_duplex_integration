@@ -1,0 +1,18 @@
+start_bridge:
+  name: Start Bridge
+  description: Start an audio bridge between two intercom devices (ESP to ESP call)
+  fields:
+    source_name:
+      name: Source Name
+      description: Friendly name of the calling device
+      required: true
+      example: "Intercom Xiaozhi"
+      selector:
+        text:
+    destination_name:
+      name: Destination Name
+      description: Friendly name of the device to call
+      required: true
+      example: "Intercom Mini"
+      selector:
+        text:

@@ -11,7 +11,7 @@
  * - Streaming  -> Show "In Call [peer]" + Hangup
  */
 
-const INTERCOM_CARD_VERSION = "2.0.0-rc3";
+const INTERCOM_CARD_VERSION = "2.0.0-rc4";
 
 class IntercomCard extends HTMLElement {
   constructor() {
@@ -47,6 +47,7 @@ class IntercomCard extends HTMLElement {
     this._previousButtonEntityId = null;
     this._nextButtonEntityId = null;
     this._callButtonEntityId = null;
+    this._declineButtonEntityId = null;
 
     // Audio streaming active (for P2P)
     this._audioStreaming = false;
@@ -164,6 +165,7 @@ class IntercomCard extends HTMLElement {
       this._previousButtonEntityId = e.previous || null;
       this._nextButtonEntityId = e.next || null;
       this._callButtonEntityId = e.call || null;
+      this._declineButtonEntityId = e.decline || null;
       this._render();
       return;
     }
@@ -183,7 +185,8 @@ class IntercomCard extends HTMLElement {
         else if (id.includes("destination")) this._destinationEntityId = id;
         else if (id.startsWith("button.") && id.includes("previous")) this._previousButtonEntityId = id;
         else if (id.startsWith("button.") && id.includes("next")) this._nextButtonEntityId = id;
-        else if (id.startsWith("button.") && id.includes("call")) this._callButtonEntityId = id;
+        else if (id.startsWith("button.") && id.includes("call") && !id.includes("decline")) this._callButtonEntityId = id;
+        else if (id.startsWith("button.") && id.includes("decline")) this._declineButtonEntityId = id;
       }
       this._render();
     } catch (err) {
@@ -228,6 +231,18 @@ class IntercomCard extends HTMLElement {
     let showCall = false;
     let buttonDisabled = this._starting || this._stopping;
 
+    // Get ESP device name for incoming call display
+    // Try activeDeviceInfo first, then search in availableDevices, fallback to config name
+    let espDeviceName = this._activeDeviceInfo?.name;
+    if (!espDeviceName && deviceId) {
+      const device = this._availableDevices.find(d =>
+        d.device_id === deviceId || d.esphome_id === deviceId ||
+        d.name === deviceId || d.name?.toLowerCase().replace(/\s+/g, '-') === deviceId
+      );
+      espDeviceName = device?.name;
+    }
+    espDeviceName = espDeviceName || name;
+
     switch (espState.toLowerCase()) {
       case "idle":
         statusText = "Ready";
@@ -236,9 +251,16 @@ class IntercomCard extends HTMLElement {
         break;
       case "calling":
       case "outgoing":
-        statusText = `Calling ${destination}...`;
-        statusClass = "transitioning";
-        showHangup = true;
+        // Special case: ESP calling "Home Assistant" = incoming call TO the card
+        if (destination === "Home Assistant") {
+          statusText = `Incoming: ${espDeviceName}`;
+          statusClass = "ringing";
+          showAnswer = true;
+        } else {
+          statusText = `Calling ${destination}...`;
+          statusClass = "transitioning";
+          showHangup = true;
+        }
         break;
       case "ringing":
       case "incoming":
@@ -495,6 +517,54 @@ class IntercomCard extends HTMLElement {
     this._chunksReceived = 0;
   }
 
+  async _answerEspCall(deviceInfo) {
+    // Answer an ESP-initiated call (ESP called Home Assistant)
+    // Similar to _startP2P but sends ANSWER instead of START
+
+    // Setup mic
+    this._mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    });
+
+    const track = this._mediaStream.getAudioTracks()[0];
+    const trackSampleRate = track?.getSettings?.().sampleRate;
+    this._audioContext = new (window.AudioContext || window.webkitAudioContext)(
+      trackSampleRate ? { sampleRate: trackSampleRate } : undefined
+    );
+    if (this._audioContext.state === "suspended") await this._audioContext.resume();
+
+    await this._audioContext.audioWorklet.addModule(`/local/intercom-processor.js?v=${INTERCOM_CARD_VERSION}`);
+    this._source = this._audioContext.createMediaStreamSource(this._mediaStream);
+    this._workletNode = new AudioWorkletNode(this._audioContext, "intercom-processor");
+    this._workletNode.port.onmessage = (e) => {
+      if (e.data.type === "audio") this._sendAudio(new Int16Array(e.data.buffer));
+    };
+    this._source.connect(this._workletNode);
+
+    // Setup speaker
+    this._playbackContext = new (window.AudioContext || window.webkitAudioContext)();
+    this._gainNode = this._playbackContext.createGain();
+    this._gainNode.gain.value = 1.0;
+    this._gainNode.connect(this._playbackContext.destination);
+
+    // Answer ESP call (sends ANSWER, not START)
+    const result = await this._hass.connection.sendMessagePromise({
+      type: "intercom_native/answer_esp_call",
+      device_id: deviceInfo.device_id,
+      host: deviceInfo.host,
+    });
+    if (!result.success) throw new Error("Answer failed");
+
+    // Subscribe to audio events
+    this._unsubscribeAudio = await this._hass.connection.subscribeEvents(
+      (e) => this._handleAudioEvent(e), "intercom_audio"
+    );
+
+    this._audioStreaming = true;
+    this._chunksSent = 0;
+    this._chunksReceived = 0;
+  }
+
   async _startBridge(sourceDevice, destinationName) {
     const destDevice = this._availableDevices.find(d => d.name === destinationName);
     if (!destDevice?.host) {
@@ -523,22 +593,34 @@ class IntercomCard extends HTMLElement {
     }
 
     this._starting = true;
+    this._activeDeviceInfo = deviceInfo;
     this._render();
 
     try {
-      // Try WS answer command
-      const res = await this._hass.connection.sendMessagePromise({
-        type: "intercom_native/answer",
-        device_id: deviceInfo.device_id,
-      });
+      const espState = this._getEspState().toLowerCase();
+      const destination = this._getDestination();
 
-      if (!res?.success && this._callButtonEntityId) {
-        // Fallback: press call button on ESP
-        await this._hass.callService("button", "press", { entity_id: this._callButtonEntityId });
+      // Check if ESP is calling HA (outgoing + destination = Home Assistant)
+      if ((espState === "outgoing" || espState === "calling") && destination === "Home Assistant") {
+        // ESP is calling us - answer with proper ANSWER message (not START)
+        await this._answerEspCall(deviceInfo);
+        this._showError("");
+      } else {
+        // Normal case: ESP is ringing (we called it), send answer command
+        const res = await this._hass.connection.sendMessagePromise({
+          type: "intercom_native/answer",
+          device_id: deviceInfo.device_id,
+        });
+
+        if (!res?.success && this._callButtonEntityId) {
+          // Fallback: press call button on ESP
+          await this._hass.callService("button", "press", { entity_id: this._callButtonEntityId });
+        }
+        this._showError("");
       }
-      this._showError("");
     } catch (err) {
       this._showError(err.message || String(err));
+      await this._cleanup();
     } finally {
       this._starting = false;
       this._render();
@@ -556,10 +638,25 @@ class IntercomCard extends HTMLElement {
     this._render();
 
     try {
-      await this._hass.connection.sendMessagePromise({
-        type: "intercom_native/decline",
-        device_id: deviceInfo.device_id,
-      });
+      const espState = this._getEspState().toLowerCase();
+      const destination = this._getDestination();
+
+      // Check if ESP is calling HA (outgoing + destination = Home Assistant)
+      if ((espState === "outgoing" || espState === "calling") && destination === "Home Assistant") {
+        // ESP is calling us - press ESP's decline button to hang up
+        if (this._declineButtonEntityId) {
+          await this._hass.callService("button", "press", { entity_id: this._declineButtonEntityId });
+        } else if (this._callButtonEntityId) {
+          // Fallback: call button acts as toggle (hangup when active)
+          await this._hass.callService("button", "press", { entity_id: this._callButtonEntityId });
+        }
+      } else {
+        // Normal decline via WS command
+        await this._hass.connection.sendMessagePromise({
+          type: "intercom_native/decline",
+          device_id: deviceInfo.device_id,
+        });
+      }
       this._showError("");
     } catch (err) {
       this._showError(err.message || String(err));

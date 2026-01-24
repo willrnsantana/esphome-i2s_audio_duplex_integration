@@ -66,6 +66,10 @@ class IntercomTcpClient:
         self._receive_task: Optional[asyncio.Task] = None
         self._ping_task: Optional[asyncio.Task] = None
 
+        # Flags to distinguish ACK PONG from keepalive PONG
+        self._awaiting_start_ack = False   # Waiting for PONG/RING after START
+        self._awaiting_answer_ack = False  # Waiting for PONG after ANSWER
+
         self._audio_sent = 0
         self._audio_recv = 0
         self._disconnect_notified = False
@@ -159,15 +163,27 @@ class IntercomTcpClient:
             if not await self.connect():
                 return "error"
 
+        # Reset state before sending START
+        self._streaming = False
+        self._ringing = False
+        self._awaiting_start_ack = True
+        self._awaiting_answer_ack = False
+
         # Send START with caller_name as payload (for PTMP mode)
         payload = caller_name.encode("utf-8") if caller_name else b""
         if not await self._send_message(MSG_START, data=payload, flags=flags):
+            self._awaiting_start_ack = False
             return "error"
 
         # Wait briefly for ESP response (PONG=accept, RING=waiting)
         # The actual state is set in _handle_message
         for _ in range(50):  # 500ms max wait
             await asyncio.sleep(0.01)
+            # Check if connection was closed
+            if not self._connected:
+                _LOGGER.error("[TCP#%d] Connection lost while waiting for response", self._instance_id)
+                self._awaiting_start_ack = False
+                return "error"
             if self._streaming:
                 _LOGGER.debug("[TCP#%d] Stream started", self._instance_id)
                 return "streaming"
@@ -175,7 +191,14 @@ class IntercomTcpClient:
                 _LOGGER.debug("[TCP#%d] ESP ringing", self._instance_id)
                 return "ringing"
 
-        # Timeout - assume old ESP that doesn't send response, treat as streaming
+        # Timeout - check if still connected before assuming streaming
+        if not self._connected:
+            _LOGGER.error("[TCP#%d] Connection lost, cannot start stream", self._instance_id)
+            self._awaiting_start_ack = False
+            return "error"
+
+        # Still connected but no response - assume old ESP that doesn't send response
+        self._awaiting_start_ack = False
         self._streaming = True
         _LOGGER.warning("[TCP#%d] No response, assuming stream started", self._instance_id)
         return "streaming"
@@ -217,15 +240,20 @@ class IntercomTcpClient:
             _LOGGER.warning("[TCP#%d] send_answer() but not ringing", self._instance_id)
             return False
 
+        # Mark that we're awaiting PONG as answer confirmation
+        self._awaiting_answer_ack = True
+
         try:
             await asyncio.wait_for(self._send_message(MSG_ANSWER), timeout=1.0)
             _LOGGER.debug("[TCP#%d] ANSWER sent", self._instance_id)
             # State will be updated when we receive PONG from ESP
             return True
         except asyncio.TimeoutError:
+            self._awaiting_answer_ack = False
             _LOGGER.warning("[TCP#%d] ANSWER timeout", self._instance_id)
             return False
         except Exception as err:
+            self._awaiting_answer_ack = False
             _LOGGER.error("[TCP#%d] ANSWER error: %s", self._instance_id, err)
             return False
 
@@ -306,25 +334,39 @@ class IntercomTcpClient:
                 self._on_audio(payload)
 
         elif msg_type == MSG_PONG:
-            _LOGGER.debug("[TCP#%d] PONG - stream accepted", self._instance_id)
-            if self._ringing:
-                # PONG after we sent ANSWER - ESP confirmed, start streaming
+            # PONG can be:
+            # 1. ACK for START (auto_answer ON) - we set _awaiting_start_ack
+            # 2. ACK for ANSWER - we set _awaiting_answer_ack
+            # 3. Keepalive response - neither flag set, IGNORE
+            if self._awaiting_answer_ack:
+                _LOGGER.debug("[TCP#%d] PONG - answer confirmed", self._instance_id)
+                self._awaiting_answer_ack = False
+                self._awaiting_start_ack = False
                 self._ringing = False
                 self._streaming = True
                 if self._on_answered:
                     self._on_answered()
-            elif not self._streaming:
-                # PONG after START means ESP accepted (auto_answer ON)
+            elif self._awaiting_start_ack:
+                _LOGGER.debug("[TCP#%d] PONG - stream accepted (auto_answer ON)", self._instance_id)
+                self._awaiting_start_ack = False
                 self._streaming = True
+            else:
+                # Keepalive PONG - do NOT change state
+                _LOGGER.debug("[TCP#%d] PONG - keepalive (ignored)", self._instance_id)
 
         elif msg_type == MSG_RING:
             _LOGGER.debug("[TCP#%d] RING received", self._instance_id)
+            # RING means ESP has auto_answer OFF - not a PONG for START
+            self._awaiting_start_ack = False
             self._ringing = True
             if self._on_ringing:
                 self._on_ringing()
 
         elif msg_type == MSG_ANSWER:
-            _LOGGER.debug("[TCP#%d] ANSWER received", self._instance_id)
+            # ANSWER from ESP (local GPIO answer) - not via our send_answer()
+            _LOGGER.debug("[TCP#%d] ANSWER received from ESP", self._instance_id)
+            self._awaiting_answer_ack = False
+            self._awaiting_start_ack = False
             self._ringing = False
             self._streaming = True
             if self._on_answered:
@@ -353,9 +395,10 @@ class IntercomTcpClient:
         try:
             while self._connected:
                 await asyncio.sleep(PING_INTERVAL)
-                # Don't ping during streaming - TCP already detects dead connections
-                # and ping could interfere with audio flow
-                if self._connected and not self._streaming:
+                # Don't ping during streaming or ringing:
+                # - Streaming: TCP already detects dead connections, ping interferes with audio
+                # - Ringing: PONG response would be confused with answer ACK
+                if self._connected and not self._streaming and not self._ringing:
                     await self._send_message(MSG_PING)
         except asyncio.CancelledError:
             pass
