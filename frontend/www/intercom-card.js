@@ -1,5 +1,5 @@
 /**
- * Intercom Card v4.0.0 - Pure mirror of ESP state
+ * Intercom Card v2.0.0 - Pure mirror of ESP state
  *
  * The card is a simple frontend that mirrors the ESP's intercom_state entity.
  * No complex internal state tracking - just read ESP state and render UI.
@@ -11,7 +11,7 @@
  * - Streaming  -> Show "In Call [peer]" + Hangup
  */
 
-const INTERCOM_CARD_VERSION = "2.0.0-rc4";
+const INTERCOM_CARD_VERSION = "2.0.0";
 
 class IntercomCard extends HTMLElement {
   constructor() {
@@ -109,7 +109,6 @@ class IntercomCard extends HTMLElement {
 
       // CRITICAL: Cleanup audio when ESP goes to Idle
       if (espStateChanged && newEspState === "idle" && (this._audioStreaming || this._activeBridgeId)) {
-        console.log("[IntercomCard] ESP went to Idle, cleaning up audio resources");
         this._cleanup();
       }
 

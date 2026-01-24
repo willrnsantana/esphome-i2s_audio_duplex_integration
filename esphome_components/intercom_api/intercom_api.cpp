@@ -337,7 +337,7 @@ void IntercomApi::start() {
     return;
   }
 
-  ESP_LOGI(TAG, "Starting intercom");
+  ESP_LOGI(TAG, "Calling %s...", this->get_current_destination().c_str());
   this->set_active_(true);
 
   // Set FSM to OUTGOING - this triggers on_outgoing_call callback
@@ -355,7 +355,7 @@ void IntercomApi::stop() {
     return;
   }
 
-  ESP_LOGI(TAG, "Stopping intercom");
+  ESP_LOGI(TAG, "Hanging up");
 
   // Send STOP message to client (HA) before closing
   if (this->client_.socket.load() >= 0) {
@@ -388,7 +388,7 @@ void IntercomApi::answer_call() {
     return;
   }
 
-  ESP_LOGI(TAG, "Answering call manually");
+  ESP_LOGI(TAG, "Answering call");
   this->send_message_(sock, MessageType::ANSWER);
   this->set_call_state_(CallState::ANSWERING);  // FSM
   this->set_active_(true);
@@ -1332,10 +1332,14 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
         caller_name.assign(reinterpret_cast<const char *>(data), name_len);
       }
 
-      ESP_LOGI(TAG, "Received START from client (auto_answer=%s, no_ring=%s, caller=%s, state=%s)",
-               this->auto_answer_ ? "ON" : "OFF", no_ring ? "YES" : "NO",
-               caller_name.empty() ? "(none)" : caller_name.c_str(),
-               call_state_to_str(this->call_state_));
+      // Log user-friendly message
+      if (no_ring) {
+        // We are the caller in a bridge, destination is the caller_name
+        ESP_LOGI(TAG, "Calling %s...", caller_name.empty() ? "unknown" : caller_name.c_str());
+      } else {
+        // We are being called
+        ESP_LOGI(TAG, "Incoming call from %s", caller_name.empty() ? "Home Assistant" : caller_name.c_str());
+      }
 
       // Publish caller name (even if empty - clears previous)
       if (this->full_mode_) {
@@ -1407,26 +1411,22 @@ void IntercomApi::handle_message_(const MessageHeader &header, const uint8_t *da
       break;
 
     case MessageType::ANSWER:
-      // ANSWER can mean two things:
-      // 1. We called someone (OUTGOING) and they answered
-      // 2. Someone called us (RINGING) and HA answered remotely
-      ESP_LOGI(TAG, "Received ANSWER from client (state=%s)", call_state_to_str(this->call_state_));
-
+      // ANSWER: call was answered (either our outgoing call or remote answer)
       if (this->call_state_ == CallState::OUTGOING) {
         // We called them, they answered - start streaming
-        ESP_LOGI(TAG, "Our outgoing call was answered");
+        ESP_LOGI(TAG, "Call answered");
         this->set_streaming_(true);  // This will set CallState::STREAMING
         this->send_message_(this->client_.socket.load(), MessageType::PONG);
       } else if (this->pending_incoming_call_) {
         // We were ringing, HA answered for us remotely
-        ESP_LOGI(TAG, "Remote answer from HA");
+        ESP_LOGI(TAG, "Call answered (remote)");
         this->pending_incoming_call_ = false;
         this->set_call_state_(CallState::ANSWERING);  // FSM
         this->set_active_(true);
         this->set_streaming_(true);  // This will set CallState::STREAMING
         this->send_message_(this->client_.socket.load(), MessageType::PONG);
       } else {
-        ESP_LOGW(TAG, "ANSWER received but not in OUTGOING or RINGING state");
+        ESP_LOGW(TAG, "ANSWER received in unexpected state");
       }
       break;
 

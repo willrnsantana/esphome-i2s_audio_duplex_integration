@@ -694,18 +694,15 @@ async def websocket_stop(
     msg_id = msg["id"]
     stopped = False
 
-    _LOGGER.info("websocket_stop called: device_id=%s", device_id)
-    _LOGGER.info("  Active sessions: %s", list(_sessions.keys()))
-    _LOGGER.info("  Active bridges: %s", list(_bridges.keys()))
-    for bid, b in _bridges.items():
-        _LOGGER.info("    Bridge %s: source=%s dest=%s active=%s",
-                     bid, b.source_device_id, b.dest_device_id, b._active)
+    _LOGGER.debug("websocket_stop called: device_id=%s", device_id)
+    _LOGGER.debug("  Active sessions: %s", list(_sessions.keys()))
+    _LOGGER.debug("  Active bridges: %s", list(_bridges.keys()))
 
     # Stop P2P session if exists
     session = _sessions.pop(device_id, None)
     if session:
         await session.stop()
-        _LOGGER.info("Session stopped: %s", device_id)
+        _LOGGER.debug("Session stopped: %s", device_id)
         stopped = True
 
     # Also stop any bridges involving this device (for callee hangup)
@@ -713,13 +710,12 @@ async def websocket_stop(
     for bridge_id, bridge in list(_bridges.items()):
         if bridge.source_device_id == device_id or bridge.dest_device_id == device_id:
             bridges_to_stop.append(bridge_id)
-            _LOGGER.info("  Found matching bridge: %s", bridge_id)
 
     for bridge_id in bridges_to_stop:
         bridge = _bridges.pop(bridge_id, None)
         if bridge:
             await bridge.stop()
-            _LOGGER.info("Bridge stopped via stop command: %s (device: %s)", bridge_id, device_id)
+            _LOGGER.debug("Bridge stopped via stop command: %s (device: %s)", bridge_id, device_id)
             stopped = True
 
     connection.send_result(msg_id, {"success": True, "stopped": stopped})
@@ -1058,15 +1054,14 @@ async def websocket_bridge_stop(
     bridge_id = msg["bridge_id"]
     msg_id = msg["id"]
 
-    _LOGGER.info("bridge_stop called: bridge_id=%s", bridge_id)
-    _LOGGER.info("  Active bridges: %s", list(_bridges.keys()))
+    _LOGGER.debug("bridge_stop called: bridge_id=%s", bridge_id)
 
     bridge = _bridges.pop(bridge_id, None)
     if bridge:
         await bridge.stop()
-        _LOGGER.info("Bridge stopped via bridge_stop: %s", bridge_id)
+        _LOGGER.debug("Bridge stopped via bridge_stop: %s", bridge_id)
     else:
-        _LOGGER.warning("bridge_stop: bridge not found: %s", bridge_id)
+        _LOGGER.debug("bridge_stop: bridge not found: %s", bridge_id)
 
     connection.send_result(msg_id, {"success": True})
 
@@ -1095,18 +1090,13 @@ async def websocket_decline(
     msg_id = msg["id"]
     stopped = False
 
-    _LOGGER.info("Decline request for device: %s", device_id)
-    _LOGGER.info("  Active sessions: %s", list(_sessions.keys()))
-    _LOGGER.info("  Active bridges: %s", list(_bridges.keys()))
-    for bid, b in _bridges.items():
-        _LOGGER.info("    Bridge %s: source=%s dest=%s active=%s",
-                     bid, b.source_device_id, b.dest_device_id, b._active)
+    _LOGGER.debug("Decline request for device: %s", device_id)
 
     # Check P2P sessions first
     session = _sessions.pop(device_id, None)
     if session:
         await session.stop()
-        _LOGGER.info("Declined P2P session for device: %s", device_id)
+        _LOGGER.debug("Declined P2P session for device: %s", device_id)
         stopped = True
 
     # Check bridges - find any where this device is source or dest
@@ -1114,13 +1104,12 @@ async def websocket_decline(
     for bridge_id, bridge in list(_bridges.items()):
         if bridge.source_device_id == device_id or bridge.dest_device_id == device_id:
             bridges_to_stop.append(bridge_id)
-            _LOGGER.info("  Found matching bridge to decline: %s", bridge_id)
 
     for bridge_id in bridges_to_stop:
         bridge = _bridges.pop(bridge_id, None)
         if bridge:
             await bridge.stop()
-            _LOGGER.info("Declined bridge %s for device: %s", bridge_id, device_id)
+            _LOGGER.debug("Declined bridge %s for device: %s", bridge_id, device_id)
             stopped = True
 
     connection.send_result(msg_id, {"success": True, "stopped": stopped})
