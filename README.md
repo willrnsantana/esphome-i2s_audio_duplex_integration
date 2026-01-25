@@ -382,12 +382,13 @@ In Simple mode, the browser communicates directly with a single ESP device throu
 
 ![Browser calling ESP](readme-img/call-from-home-assistant-to-esp.gif)
 
+```mermaid
+flowchart LR
+    Browser <-->|WS| HA[Home Assistant]
+    HA <-->|TCP 6054| ESP
 ```
-┌──────────┐         ┌──────────┐         ┌──────────┐
-│  Browser │◄──WS───►│    HA    │◄──TCP──►│   ESP    │
-│          │         │          │  6054   │          │
-└──────────┘         └──────────┘         └──────────┘
 
+```
 Call Flow:
 1. User clicks "Call" in browser
 2. Card sends intercom_native/start to HA
