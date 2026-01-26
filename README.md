@@ -400,8 +400,9 @@ Full mode includes everything from Simple mode (Browser ↔ ESP calls) **plus** 
 
 ```mermaid
 graph TB
-    ESP1[📻 ESP #1<br/>Kitchen] <-->|TCP 6054| HA[🏠 HA Bridge<br/>relay]
+    ESP1[📻 ESP #1<br/>Kitchen] <-->|TCP 6054| HA[🏠 HA<br/>PBX hub]
     ESP2[📻 ESP #2<br/>Bedroom] <-->|TCP 6054| HA
+    Browser[🌐 Browser/App] <-->|WebSocket| HA
 ```
 
 **Call Flow (ESP #1 calls ESP #2):**
