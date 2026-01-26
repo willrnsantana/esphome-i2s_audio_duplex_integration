@@ -83,7 +83,8 @@ This component was born from the limitations of [esphome-intercom](https://githu
 - **Two operating modes**:
   - **Simple**: Browser ↔ Home Assistant ↔ ESP
   - **Full**: ESP ↔ Home Assistant ↔ ESP (intercom between devices)
-- **Echo Cancellation (AEC)** - Built-in acoustic echo cancellation using ESP-SR (this is a notoriously difficult feature to implement correctly; it works but still needs improvement)
+- **Echo Cancellation (AEC)** - Built-in acoustic echo cancellation using ESP-SR
+  *(this is a notoriously difficult feature to implement correctly; it works but still needs improvement)*
 - **Auto Answer** - Configurable automatic call acceptance
 - **Volume Control** - Adjustable speaker volume and microphone gain
 - **Contact Management** - Select call destination from discovered devices
