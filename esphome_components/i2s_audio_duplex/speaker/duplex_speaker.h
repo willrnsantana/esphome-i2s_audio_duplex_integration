@@ -21,6 +21,7 @@ class I2SAudioDuplexSpeaker : public speaker::Speaker,
   // speaker::Speaker interface
   void start() override;
   void stop() override;
+  void loop() override;
   void finish() override;
 
   size_t play(const uint8_t *data, size_t length) override;
@@ -30,6 +31,9 @@ class I2SAudioDuplexSpeaker : public speaker::Speaker,
 
   void set_volume(float volume) override;
   void set_mute_state(bool mute_state) override;
+protected:
+  SemaphoreHandle_t active_listeners_semaphore_{nullptr};
+
 };
 
 }  // namespace i2s_audio_duplex
