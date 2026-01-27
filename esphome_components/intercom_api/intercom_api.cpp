@@ -694,6 +694,39 @@ void IntercomApi::set_streaming_(bool on) {
   this->state_ = on ? ConnectionState::STREAMING : ConnectionState::CONNECTED;
   if (on) {
     this->pending_incoming_call_ = false;  // Call answered, no longer pending
+
+    // Reset audio buffers for new call - prevents stale data on quick reconnect
+    if (this->mic_buffer_) {
+      if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(20)) == pdTRUE) {
+        this->mic_buffer_->reset();
+        xSemaphoreGive(this->mic_mutex_);
+      }
+    }
+    if (this->speaker_buffer_) {
+      if (xSemaphoreTake(this->speaker_mutex_, pdMS_TO_TICKS(20)) == pdTRUE) {
+        this->speaker_buffer_->reset();
+        xSemaphoreGive(this->speaker_mutex_);
+      }
+    }
+
+#ifdef USE_ESP_AEC
+    // Reset AEC state for new call - critical for proper echo cancellation
+    if (this->aec_enabled_ && this->spk_ref_buffer_ != nullptr) {
+      this->aec_mic_fill_ = 0;
+      if (xSemaphoreTake(this->spk_ref_mutex_, pdMS_TO_TICKS(20)) == pdTRUE) {
+        this->spk_ref_buffer_->reset();
+        // Pre-fill with delay compensation silence (80ms)
+        uint8_t *silence = (uint8_t *) heap_caps_calloc(1, AEC_REF_DELAY_BYTES, MALLOC_CAP_INTERNAL);
+        if (silence) {
+          this->spk_ref_buffer_->write(silence, AEC_REF_DELAY_BYTES);
+          heap_caps_free(silence);
+          ESP_LOGD(TAG, "AEC buffers reset, pre-filled %ums silence", (unsigned)AEC_REF_DELAY_MS);
+        }
+        xSemaphoreGive(this->spk_ref_mutex_);
+      }
+    }
+#endif
+
     this->set_call_state_(CallState::STREAMING);  // FSM - trigger fired there
   }
   this->publish_state_();
@@ -1006,8 +1039,40 @@ void IntercomApi::tx_task_() {
           ESP_LOGW(TAG, "AEC: mutex timeout");
         }
 
-        // Process AEC
-        this->aec_->process(this->aec_mic_, this->aec_ref_, this->aec_out_, this->aec_frame_samples_);
+        // Calculate reference energy
+        int64_t ref_energy = 0;
+        for (int i = 0; i < this->aec_frame_samples_; i++) {
+          ref_energy += (int64_t)this->aec_ref_[i] * this->aec_ref_[i];
+        }
+        int ref_rms = (int)sqrt((double)ref_energy / this->aec_frame_samples_);
+
+        // Skip AEC when reference is too low (no echo to cancel)
+        if (ref_rms < 50) {
+          memcpy(this->aec_out_, this->aec_mic_, this->aec_frame_samples_ * sizeof(int16_t));
+        } else {
+          // Process AEC
+          this->aec_->process(this->aec_mic_, this->aec_ref_, this->aec_out_, this->aec_frame_samples_);
+        }
+
+        // Debug: log AEC stats periodically
+        static uint32_t aec_frame_count = 0;
+        static uint32_t aec_skipped = 0;
+        aec_frame_count++;
+        if (ref_rms < 50) aec_skipped++;
+
+        if (aec_frame_count % 100 == 0) {  // Every ~3 seconds at 32ms/frame
+          int64_t mic_sum = 0, out_sum = 0;
+          for (int i = 0; i < this->aec_frame_samples_; i++) {
+            mic_sum += (int64_t)this->aec_mic_[i] * this->aec_mic_[i];
+            out_sum += (int64_t)this->aec_out_[i] * this->aec_out_[i];
+          }
+          int mic_rms = (int)sqrt((double)mic_sum / this->aec_frame_samples_);
+          int out_rms = (int)sqrt((double)out_sum / this->aec_frame_samples_);
+          ESP_LOGI(TAG, "AEC #%lu: mic=%d ref=%d out=%d %s (skip: %lu/%lu)",
+                   (unsigned long)aec_frame_count, mic_rms, ref_rms, out_rms,
+                   ref_rms >= 50 ? (mic_rms > 0 ? (out_rms < mic_rms ? "CANCEL" : "pass") : "quiet") : "SKIP",
+                   (unsigned long)aec_skipped, (unsigned long)aec_frame_count);
+        }
 
         // Send processed audio (may be larger than AUDIO_CHUNK_SIZE)
         size_t out_bytes = this->aec_frame_samples_ * sizeof(int16_t);
