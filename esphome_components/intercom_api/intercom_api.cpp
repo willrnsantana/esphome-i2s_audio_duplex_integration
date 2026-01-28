@@ -1635,31 +1635,17 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
     return;
   }
 
+  // NOTE: With MicrophoneSource pattern, data arrives as 16-bit regardless of mic hardware.
+  // MicrophoneSource handles bit conversion internally.
+  // We only apply DC offset removal and gain if configured.
+
   static constexpr size_t MAX_SAMPLES = 512;
-  int16_t converted[MAX_SAMPLES];
-  size_t num_samples;
+  const int16_t *src = reinterpret_cast<const int16_t *>(data);
+  size_t num_samples = std::min(len / sizeof(int16_t), MAX_SAMPLES);
   bool needs_processing = this->mic_gain_ != 1.0f || this->dc_offset_removal_;
 
-  if (this->mic_bits_ == 32) {
-    // 32-bit mic (e.g., SPH0645) - always needs conversion to 16-bit
-    const int32_t *src = reinterpret_cast<const int32_t *>(data);
-    num_samples = std::min(len / sizeof(int32_t), MAX_SAMPLES);
-
-    for (size_t i = 0; i < num_samples; i++) {
-      int32_t sample = src[i] >> 16;  // Extract upper 16 bits
-      if (this->dc_offset_removal_) {
-        this->dc_offset_ = ((this->dc_offset_ * 255) >> 8) + sample;
-        sample -= (this->dc_offset_ >> 8);
-      }
-      sample = static_cast<int32_t>(sample * this->mic_gain_);
-      if (sample > 32767) sample = 32767;
-      if (sample < -32768) sample = -32768;
-      converted[i] = static_cast<int16_t>(sample);
-    }
-  } else if (needs_processing) {
-    // 16-bit mic with gain or DC offset
-    const int16_t *src = reinterpret_cast<const int16_t *>(data);
-    num_samples = std::min(len / sizeof(int16_t), MAX_SAMPLES);
+  if (needs_processing) {
+    int16_t converted[MAX_SAMPLES];
 
     for (size_t i = 0; i < num_samples; i++) {
       int32_t sample = src[i];
@@ -1672,8 +1658,18 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
       if (sample < -32768) sample = -32768;
       converted[i] = static_cast<int16_t>(sample);
     }
+
+    if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
+      this->mic_buffer_->write(converted, num_samples * sizeof(int16_t));
+      xSemaphoreGive(this->mic_mutex_);
+    } else {
+      static uint32_t mic_drops = 0;
+      if (++mic_drops <= 5 || mic_drops % 100 == 0) {
+        ESP_LOGW(TAG, "Mic data dropped: %lu total", (unsigned long)mic_drops);
+      }
+    }
   } else {
-    // 16-bit mic, direct passthrough (gain=1.0, no DC offset)
+    // Direct passthrough (gain=1.0, no DC offset)
     if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
       this->mic_buffer_->write((void *)data, len);
       xSemaphoreGive(this->mic_mutex_);
@@ -1682,18 +1678,6 @@ void IntercomApi::on_microphone_data_(const uint8_t *data, size_t len) {
       if (++mic_drops <= 5 || mic_drops % 100 == 0) {
         ESP_LOGW(TAG, "Mic data dropped: %lu total", (unsigned long)mic_drops);
       }
-    }
-    return;
-  }
-
-  // Write processed samples
-  if (xSemaphoreTake(this->mic_mutex_, pdMS_TO_TICKS(10)) == pdTRUE) {
-    this->mic_buffer_->write(converted, num_samples * sizeof(int16_t));
-    xSemaphoreGive(this->mic_mutex_);
-  } else {
-    static uint32_t mic_drops = 0;
-    if (++mic_drops <= 5 || mic_drops % 100 == 0) {
-      ESP_LOGW(TAG, "Mic data dropped: %lu total", (unsigned long)mic_drops);
     }
   }
 }
