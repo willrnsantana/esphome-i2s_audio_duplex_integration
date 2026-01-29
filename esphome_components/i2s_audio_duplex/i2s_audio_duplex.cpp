@@ -417,6 +417,14 @@ void I2SAudioDuplex::audio_task_() {
         did_work = true;
         int16_t *output_buffer = mic_buffer;  // Default: no AEC processing
 
+        // Apply pre-AEC mic attenuation for hot mics (ES8311)
+        // This prevents clipping/distortion BEFORE AEC processing
+        if (this->mic_attenuation_ != 1.0f) {
+          for (size_t i = 0; i < frame_size; i++) {
+            mic_buffer[i] = (int16_t)(mic_buffer[i] * this->mic_attenuation_);
+          }
+        }
+
 #ifdef USE_ESP_AEC
         // Process through AEC if enabled and initialized
         if (this->aec_ != nullptr && this->aec_enabled_ && this->aec_->is_initialized() &&
@@ -447,9 +455,9 @@ void I2SAudioDuplex::audio_task_() {
             int ref_rms = (int)sqrt((double)ref_sum / frame_size);
             int out_rms = (int)sqrt((double)out_sum / frame_size);
             int reduction = (mic_rms > 0) ? (100 - (out_rms * 100 / mic_rms)) : 0;
-            ESP_LOGI(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% reduction, aec_ref_vol=%.2f)",
+            ESP_LOGI(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% red, atten=%.2f refvol=%.2f)",
                      (unsigned long)this->aec_frame_count_, mic_rms, ref_rms, out_rms,
-                     reduction, this->aec_ref_volume_);
+                     reduction, this->mic_attenuation_, this->aec_ref_volume_);
           }
         }
 #endif
@@ -499,16 +507,15 @@ void I2SAudioDuplex::audio_task_() {
 
 #ifdef USE_ESP_AEC
       // Store speaker reference for AEC
-      // For codecs with hardware volume (ES8311), aec_ref_volume_ should match the codec's
-      // output volume so the reference amplitude matches the actual echo picked up by mic.
+      // Scale reference by: codec hardware volume * mic_attenuation
+      // This matches what the attenuated mic actually "hears" as echo
       // CRITICAL: Always write to ref buffer, even when got=0 (silence padded)
-      // Otherwise ref buffer falls behind real-time, causing AEC desync
       if (this->speaker_ref_buffer_ != nullptr) {
-        if (this->aec_ref_volume_ != 1.0f) {
-          // Scale reference to match codec hardware volume
-          // Use spk_ref_buffer which was allocated for AEC
+        float ref_scale = this->aec_ref_volume_ * this->mic_attenuation_;
+        if (ref_scale != 1.0f) {
+          // Scale reference to match attenuated mic
           for (size_t i = 0; i < frame_size; i++) {
-            int32_t sample = (int32_t)(spk_buffer[i] * this->aec_ref_volume_);
+            int32_t sample = (int32_t)(spk_buffer[i] * ref_scale);
             if (sample > 32767) sample = 32767;
             if (sample < -32768) sample = -32768;
             spk_ref_buffer[i] = (int16_t) sample;

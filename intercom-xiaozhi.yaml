@@ -141,6 +141,7 @@ i2s_audio_duplex:
   sample_rate: 16000
   aec_id: aec_component   # AEC here for perfect mic/speaker sync (same audio task)
   aec_reference_delay_ms: 10  # ES8311 integrated codec - minimal acoustic delay
+  mic_attenuation: 0.1       # -20dB: ES8311 ADC is very hot, attenuate BEFORE AEC to prevent clipping
 
 # ==============================================================================
 # MICROPHONE (via duplex platform)

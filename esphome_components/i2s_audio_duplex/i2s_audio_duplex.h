@@ -49,6 +49,12 @@ class I2SAudioDuplex : public Component {
   // Volume control (0.0 - 1.0)
   void set_mic_gain(float gain) { this->mic_gain_ = gain; }
   float get_mic_gain() const { return this->mic_gain_; }
+
+  // Pre-AEC mic attenuation - for hot mics like ES8311 that overdrive
+  // Applied BEFORE AEC to prevent clipping/distortion from breaking echo cancellation
+  // Value is linear: 0.1 = -20dB, 0.5 = -6dB, 1.0 = no attenuation
+  void set_mic_attenuation(float atten) { this->mic_attenuation_ = atten; }
+  float get_mic_attenuation() const { return this->mic_attenuation_; }
   void set_speaker_volume(float volume) { this->speaker_volume_ = volume; }
   float get_speaker_volume() const { return this->speaker_volume_; }
 
@@ -124,9 +130,10 @@ class I2SAudioDuplex : public Component {
   uint32_t aec_frame_count_{0};  // Debug counter, reset on start()
 
   // Volume control
-  float mic_gain_{1.0f};       // 0.0 - 2.0 (1.0 = unity gain)
-  float speaker_volume_{1.0f}; // 0.0 - 1.0 (for digital volume, keep 1.0 if codec has hardware volume)
-  float aec_ref_volume_{1.0f}; // AEC reference scaling (set to codec's output volume for proper echo matching)
+  float mic_gain_{1.0f};         // 0.0 - 2.0 (1.0 = unity gain, applied AFTER AEC)
+  float mic_attenuation_{1.0f};  // Pre-AEC attenuation for hot mics (0.1 = -20dB, applied BEFORE AEC)
+  float speaker_volume_{1.0f};   // 0.0 - 1.0 (for digital volume, keep 1.0 if codec has hardware volume)
+  float aec_ref_volume_{1.0f};   // AEC reference scaling (set to codec's output volume for proper echo matching)
   uint32_t aec_ref_delay_ms_{80}; // AEC reference delay in ms (80 for separate I2S, 20-40 for ES8311)
 };
 
