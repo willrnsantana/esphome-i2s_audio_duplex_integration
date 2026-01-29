@@ -1025,9 +1025,9 @@ void IntercomApi::tx_task_() {
         // Always process AEC - no skip threshold to avoid audio discontinuities
         this->aec_->process(this->aec_mic_, this->aec_ref_, this->aec_out_, this->aec_frame_samples_);
 
-        // Debug: log AEC stats periodically
+        // Debug: log AEC stats periodically (every ~16 seconds)
         static uint32_t aec_frame_count = 0;
-        if (++aec_frame_count % 100 == 0) {  // Every ~3 seconds at 32ms/frame
+        if (++aec_frame_count % 500 == 0) {
           int64_t mic_sum = 0, ref_sum = 0, out_sum = 0;
           for (int i = 0; i < this->aec_frame_samples_; i++) {
             mic_sum += (int64_t)this->aec_mic_[i] * this->aec_mic_[i];
@@ -1038,7 +1038,7 @@ void IntercomApi::tx_task_() {
           int ref_rms = (int)sqrt((double)ref_sum / this->aec_frame_samples_);
           int out_rms = (int)sqrt((double)out_sum / this->aec_frame_samples_);
           int reduction = (mic_rms > 0) ? (100 - (out_rms * 100 / mic_rms)) : 0;
-          ESP_LOGI(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% reduction)",
+          ESP_LOGD(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% reduction)",
                    (unsigned long)aec_frame_count, mic_rms, ref_rms, out_rms, reduction);
         }
 

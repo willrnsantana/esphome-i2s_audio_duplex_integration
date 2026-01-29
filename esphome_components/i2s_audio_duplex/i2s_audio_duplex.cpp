@@ -349,14 +349,6 @@ size_t I2SAudioDuplex::play(const uint8_t *data, size_t len, TickType_t ticks_to
   // Write to speaker buffer for playback
   size_t written = this->speaker_buffer_->write_without_replacement((void *) data, len, ticks_to_wait, true);
 
-  // DEBUG: log play() calls
-  static uint32_t play_dbg = 0;
-  if (++play_dbg % 50 == 0) {
-    ESP_LOGI(TAG, "play() #%lu: len=%zu wr=%zu ref_buf=%s",
-             (unsigned long)play_dbg, len, written,
-             this->speaker_ref_buffer_ ? "OK" : "NULL");
-  }
-
 #ifdef USE_ESP_AEC
   // CRITICAL FIX: Capture reference HERE when data enters the pipeline
   // This matches Mini's timing where reference is captured when speaker->play() is called
@@ -479,8 +471,8 @@ void I2SAudioDuplex::audio_task_() {
           this->aec_->process(mic_buffer, spk_ref_buffer, aec_output, frame_size);
           output_buffer = aec_output;
 
-          // Debug: log AEC stats periodically (same as intercom_api)
-          if (++this->aec_frame_count_ % 100 == 0) {
+          // Debug: log AEC stats periodically (every ~16 seconds)
+          if (++this->aec_frame_count_ % 500 == 0) {
             int64_t mic_sum = 0, ref_sum = 0, out_sum = 0;
             for (size_t i = 0; i < frame_size; i++) {
               mic_sum += (int64_t)mic_buffer[i] * mic_buffer[i];
@@ -491,9 +483,8 @@ void I2SAudioDuplex::audio_task_() {
             int ref_rms = (int)sqrt((double)ref_sum / frame_size);
             int out_rms = (int)sqrt((double)out_sum / frame_size);
             int reduction = (mic_rms > 0) ? (100 - (out_rms * 100 / mic_rms)) : 0;
-            ESP_LOGI(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% red, atten=%.2f refvol=%.2f)",
-                     (unsigned long)this->aec_frame_count_, mic_rms, ref_rms, out_rms,
-                     reduction, this->mic_attenuation_, this->aec_ref_volume_);
+            ESP_LOGD(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% reduction)",
+                     (unsigned long)this->aec_frame_count_, mic_rms, ref_rms, out_rms, reduction);
           }
         }
 #endif
