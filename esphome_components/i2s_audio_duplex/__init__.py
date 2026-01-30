@@ -25,12 +25,20 @@ CONF_MIC_ATTENUATION = "mic_attenuation"
 CONF_USE_STEREO_AEC_REF = "use_stereo_aec_reference"
 CONF_I2S_AUDIO_DUPLEX_ID = "i2s_audio_duplex_id"
 
+CONF_I2S_MODE = "i2s_mode"
+
 CONF_MONO = "mono"
 CONF_LEFT = "left"
 CONF_RIGHT = "right"
 CONF_STEREO = "stereo"
 CONF_BOTH = "both"
 CONF_BITS_PER_CHANNEL = "bits_per_channel"
+
+i2s_mode_t = cg.global_ns.enum("i2s_mode_t")
+I2S_MODE_OPTIONS = {
+    CONF_PRIMARY: i2s_mode_t.I2S_MODE_MASTER,  # NOLINT
+    CONF_SECONDARY: i2s_mode_t.I2S_MODE_SLAVE,  # NOLINT
+}
 
 i2s_bits_per_chan_t = cg.global_ns.enum("i2s_bits_per_chan_t")
 I2S_BITS_PER_CHANNEL = {
@@ -85,6 +93,9 @@ def i2s_audio_component_schema(
             ),
             cv.Optional(CONF_BITS_PER_SAMPLE, default=default_bits_per_sample): cv.All(
                 _validate_bits, cv.one_of(*I2S_BITS_PER_SAMPLE)
+            ),
+            cv.Optional(CONF_I2S_MODE, default=CONF_PRIMARY): cv.one_of(
+                *I2S_MODE_OPTIONS, lower=True
             ),
             cv.Optional(CONF_BITS_PER_CHANNEL, default="default"): cv.All(
                 cv.Any(cv.float_with_unit("bits", "bit"), "default"),
