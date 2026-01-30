@@ -57,6 +57,8 @@ I2S_CHANNELS = {
     CONF_STEREO: i2s_channel_fmt_t.I2S_CHANNEL_FMT_RIGHT_LEFT,  # stereo data to both channels
 }
 
+_validate_bits = cv.float_with_unit("bits", "bit")
+
 i2s_audio_duplex_ns = cg.esphome_ns.namespace("i2s_audio_duplex")
 I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
 
