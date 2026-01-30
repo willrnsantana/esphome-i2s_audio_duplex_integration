@@ -13,9 +13,11 @@ static const char *const TAG = "i2s_duplex.mic";
 void I2SAudioDuplexMicrophone::setup() {
   ESP_LOGCONFIG(TAG, "Setting up I2S Audio Duplex Microphone...");
 
+  // Create counting semaphore for reference counting multiple listeners
+  // Initialized to MAX_LISTENERS (all available) - taking decrements, giving increments
   this->active_listeners_semaphore_ = xSemaphoreCreateCounting(MAX_LISTENERS, MAX_LISTENERS);
   if (this->active_listeners_semaphore_ == nullptr) {
-    ESP_LOGE(TAG, "Creating semaphore failed");
+    ESP_LOGE(TAG, "Failed to create semaphore");
     this->mark_failed();
     return;
   }
@@ -40,6 +42,8 @@ void I2SAudioDuplexMicrophone::start() {
   if (this->is_failed())
     return;
 
+  // Take semaphore to register as active listener
+  // Non-blocking (0 timeout) - if all slots taken, this listener won't be counted
   xSemaphoreTake(this->active_listeners_semaphore_, 0);
 }
 
@@ -47,6 +51,7 @@ void I2SAudioDuplexMicrophone::stop() {
   if (this->state_ == microphone::STATE_STOPPED || this->is_failed())
     return;
 
+  // Give semaphore to unregister as listener
   xSemaphoreGive(this->active_listeners_semaphore_);
 }
 
@@ -62,43 +67,41 @@ void I2SAudioDuplexMicrophone::on_audio_data_(const uint8_t *data, size_t len) {
 }
 
 void I2SAudioDuplexMicrophone::loop() {
-  // Start the microphone if any semaphores are taken
-  if ((uxSemaphoreGetCount(this->active_listeners_semaphore_) < MAX_LISTENERS) &&
-      (this->state_ == microphone::STATE_STOPPED)) {
+  // Check semaphore count to decide when to start/stop
+  UBaseType_t count = uxSemaphoreGetCount(this->active_listeners_semaphore_);
+
+  // Start the microphone if any semaphores are taken (listeners active)
+  if ((count < MAX_LISTENERS) && (this->state_ == microphone::STATE_STOPPED)) {
     this->state_ = microphone::STATE_STARTING;
   }
-  // Stop the microphone if all semaphores are returned
-  if ((uxSemaphoreGetCount(this->active_listeners_semaphore_) == MAX_LISTENERS) &&
-      (this->state_ == microphone::STATE_RUNNING)) {
+
+  // Stop the microphone if all semaphores are returned (no listeners)
+  if ((count == MAX_LISTENERS) && (this->state_ == microphone::STATE_RUNNING)) {
     this->state_ = microphone::STATE_STOPPING;
   }
 
   switch (this->state_) {
     case microphone::STATE_STARTING:
-
       if (this->status_has_error()) {
         break;
       }
 
       ESP_LOGI(TAG, "Starting microphone...");
-      // Start the parent duplex component (handles both mic and speaker)
       this->parent_->start_mic();
-
       this->state_ = microphone::STATE_RUNNING;
       ESP_LOGI(TAG, "Microphone started");
-
       break;
+
     case microphone::STATE_RUNNING:
       break;
+
     case microphone::STATE_STOPPING:
       ESP_LOGI(TAG, "Stopping microphone...");
-
-      // Stop the parent duplex component
       this->parent_->stop_mic();
-
       this->state_ = microphone::STATE_STOPPED;
-  ESP_LOGI(TAG, "Microphone stopped");
+      ESP_LOGI(TAG, "Microphone stopped");
       break;
+
     case microphone::STATE_STOPPED:
       break;
   }

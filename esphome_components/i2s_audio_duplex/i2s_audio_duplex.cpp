@@ -4,6 +4,7 @@
 
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
+#include "../intercom_api/intercom_protocol.h"  // For AEC delay constants
 
 #ifdef USE_ESP_AEC
 #include "../esp_aec/esp_aec.h"
@@ -12,13 +13,15 @@
 namespace esphome {
 namespace i2s_audio_duplex {
 
+static constexpr size_t SAMPLE_RATE = 16000;
+static constexpr size_t BYTES_PER_SAMPLE = 2;
+
 static const char *const TAG = "i2s_audio_duplex";
 
 // Audio parameters
 static const size_t DMA_BUFFER_COUNT = 8;
 static const size_t DMA_BUFFER_SIZE = 512;
-static const size_t FRAME_SIZE = 256;  // samples per frame
-static const size_t FRAME_BYTES = FRAME_SIZE * sizeof(int16_t);
+static const size_t DEFAULT_FRAME_SIZE = 256;  // samples per frame (used when no AEC)
 static const size_t SPEAKER_BUFFER_SIZE = 8192;
 
 // I2S new driver uses milliseconds directly, NOT FreeRTOS ticks
@@ -42,11 +45,18 @@ void I2SAudioDuplex::setup() {
 
 void I2SAudioDuplex::set_aec(esp_aec::EspAec *aec) {
   this->aec_ = aec;
+  // Enable AEC runtime flag only if AEC is actually configured
+  this->aec_enabled_ = (aec != nullptr);
   // Create speaker reference buffer for AEC now (since set_aec is called after setup)
   if (aec != nullptr && !this->speaker_ref_buffer_) {
-    this->speaker_ref_buffer_ = RingBuffer::create(SPEAKER_BUFFER_SIZE);
+    // Buffer needs to hold: delay samples + working frames
+    // Use configurable delay (default 80ms, can be set lower for integrated codecs)
+    size_t delay_bytes = (SAMPLE_RATE * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
+    size_t ref_buffer_size = delay_bytes + SPEAKER_BUFFER_SIZE;
+    this->speaker_ref_buffer_ = RingBuffer::create(ref_buffer_size);
     if (this->speaker_ref_buffer_) {
-      ESP_LOGI(TAG, "AEC speaker reference buffer created");
+      ESP_LOGI(TAG, "AEC speaker reference buffer created (size=%u, delay=%ums)",
+               (unsigned)ref_buffer_size, (unsigned)this->aec_ref_delay_ms_);
     } else {
       ESP_LOGE(TAG, "Failed to create AEC speaker reference buffer");
     }
@@ -109,8 +119,8 @@ bool I2SAudioDuplex::init_i2s_duplex_() {
     return pin >= 0 ? (gpio_num_t) pin : GPIO_NUM_NC;
   };
 
-  // Standard mode configuration
-  i2s_std_config_t std_cfg = {
+  // Standard mode configuration for TX (always mono)
+  i2s_std_config_t tx_cfg = {
       .clk_cfg = {
           .sample_rate_hz = this->sample_rate_,
           .clk_src = I2S_CLK_SRC_DEFAULT,
@@ -130,13 +140,22 @@ bool I2SAudioDuplex::init_i2s_duplex_() {
           },
       },
   };
+  tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
 
-  // Set slot mask to left channel
-  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+  // RX configuration - stereo if using ES8311 digital feedback, mono otherwise
+  i2s_std_config_t rx_cfg = tx_cfg;
+  if (this->use_stereo_aec_ref_) {
+    // ES8311 digital feedback: L=DAC(ref), R=ADC(mic)
+    rx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO);
+    rx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
+    ESP_LOGI(TAG, "RX configured as STEREO for ES8311 digital feedback AEC");
+  } else {
+    rx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+  }
 
   // Initialize TX channel if available
   if (this->tx_handle_) {
-    err = i2s_channel_init_std_mode(this->tx_handle_, &std_cfg);
+    err = i2s_channel_init_std_mode(this->tx_handle_, &tx_cfg);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to init TX channel: %s", esp_err_to_name(err));
       this->deinit_i2s_();
@@ -145,15 +164,15 @@ bool I2SAudioDuplex::init_i2s_duplex_() {
     ESP_LOGD(TAG, "TX channel initialized");
   }
 
-  // Initialize RX channel if available
+  // Initialize RX channel if available (may be stereo for ES8311 digital feedback)
   if (this->rx_handle_) {
-    err = i2s_channel_init_std_mode(this->rx_handle_, &std_cfg);
+    err = i2s_channel_init_std_mode(this->rx_handle_, &rx_cfg);
     if (err != ESP_OK) {
       ESP_LOGE(TAG, "Failed to init RX channel: %s", esp_err_to_name(err));
       this->deinit_i2s_();
       return false;
     }
-    ESP_LOGD(TAG, "RX channel initialized");
+    ESP_LOGD(TAG, "RX channel initialized (%s)", this->use_stereo_aec_ref_ ? "stereo" : "mono");
   }
 
   // Enable channels with error checking
@@ -219,6 +238,28 @@ void I2SAudioDuplex::start() {
   // Clear speaker buffer
   this->speaker_buffer_->reset();
 
+#ifdef USE_ESP_AEC
+  // Pre-fill reference buffer with silence to create delay (MONO mode only)
+  // This compensates for I2S DMA latency + acoustic delay
+  // The mic captures echo from audio played X ms ago, so we delay the reference
+  // Delay is configurable: 80ms for separate I2S, 20-40ms for integrated codecs like ES8311
+  // STEREO mode (ES8311 digital feedback) doesn't need this - reference is sample-aligned
+  if (this->speaker_ref_buffer_ != nullptr && this->aec_ != nullptr && !this->use_stereo_aec_ref_) {
+    this->speaker_ref_buffer_->reset();
+    size_t delay_bytes = (SAMPLE_RATE * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
+    // Allocate temp buffer for silence
+    uint8_t *silence = (uint8_t *) heap_caps_calloc(1, delay_bytes, MALLOC_CAP_INTERNAL);
+    if (silence) {
+      this->speaker_ref_buffer_->write_without_replacement(silence, delay_bytes, 0, true);
+      heap_caps_free(silence);
+      ESP_LOGI(TAG, "AEC reference buffer pre-filled with %ums of silence for delay compensation",
+               (unsigned)this->aec_ref_delay_ms_);
+    }
+  } else if (this->use_stereo_aec_ref_) {
+    ESP_LOGI(TAG, "Using ES8311 digital feedback - reference is sample-aligned (no delay needed)");
+  }
+#endif
+
   // Create audio task on core 1
   xTaskCreatePinnedToCore(
       audio_task,
@@ -239,9 +280,17 @@ void I2SAudioDuplex::stop() {
   }
 
   ESP_LOGI(TAG, "Stopping duplex audio...");
+
+  // Step 1: Set all flags to false FIRST so audio task stops doing I/O
+  this->mic_running_ = false;
+  this->speaker_running_ = false;
   this->duplex_running_ = false;
 
-  // Disable channels FIRST to unblock any pending read/write operations
+  // Step 2: Wait for audio task to complete current I/O operation
+  // I2S operations have 50ms timeout, so wait a bit longer
+  vTaskDelay(pdMS_TO_TICKS(60));
+
+  // Step 3: Now safe to disable channels (task should be idle or exited)
   esp_err_t err;
   if (this->tx_handle_) {
     err = i2s_channel_disable(this->tx_handle_);
@@ -256,17 +305,17 @@ void I2SAudioDuplex::stop() {
     }
   }
 
-  // Now wait for task to finish (should exit quickly since channels are disabled)
+  // Step 4: Wait for task to fully exit
   if (this->audio_task_handle_) {
     int wait_count = 0;
-    while (eTaskGetState(this->audio_task_handle_) != eDeleted && wait_count < 100) {
+    while (eTaskGetState(this->audio_task_handle_) != eDeleted && wait_count < 50) {
       vTaskDelay(pdMS_TO_TICKS(10));
       wait_count++;
     }
     this->audio_task_handle_ = nullptr;
   }
 
-  // Delete channels (already disabled)
+  // Step 5: Delete channels
   if (this->tx_handle_) {
     i2s_del_channel(this->tx_handle_);
     this->tx_handle_ = nullptr;
@@ -275,12 +324,6 @@ void I2SAudioDuplex::stop() {
     i2s_del_channel(this->rx_handle_);
     this->rx_handle_ = nullptr;
   }
-
-  this->mic_running_ = false;
-  this->speaker_running_ = false;
-
-  // Small delay to let I2S fully deinitialize
-  vTaskDelay(pdMS_TO_TICKS(30));
 
   ESP_LOGI(TAG, "Duplex audio stopped");
 }
@@ -318,15 +361,41 @@ size_t I2SAudioDuplex::play(const uint8_t *data, size_t len, TickType_t ticks_to
     return 0;
   }
 
-  // Store speaker data as reference for AEC (non-blocking, best effort)
-  if (this->speaker_ref_buffer_ != nullptr) {
-    this->speaker_ref_buffer_->write_without_replacement((void *) data, len, 0, true);
-  }
+  // Write to speaker buffer for playback
+  size_t written = this->speaker_buffer_->write_without_replacement((void *) data, len, ticks_to_wait, true);
 
-  // Use write_without_replacement which properly supports timeout
-  // This avoids the non-thread-safe free() call in regular write()
-  // Note: RingBuffer timeout is in FreeRTOS ticks (NOT milliseconds)
-  return this->speaker_buffer_->write_without_replacement((void *) data, len, ticks_to_wait, true);
+#ifdef USE_ESP_AEC
+  // CRITICAL FIX: Capture reference HERE when data enters the pipeline
+  // This matches Mini's timing where reference is captured when speaker->play() is called
+  // NOT in audio_task where speaker_buffer latency (50-100ms) would desync the reference
+  if (this->speaker_ref_buffer_ != nullptr && written > 0) {
+    // Scale reference to match what the attenuated mic will "hear"
+    float ref_scale = this->aec_ref_volume_ * this->mic_attenuation_;
+    if (ref_scale != 1.0f) {
+      // Need temp buffer for scaling
+      size_t num_samples = written / sizeof(int16_t);
+      const int16_t *src = reinterpret_cast<const int16_t *>(data);
+      // Use stack buffer for small writes, heap for large
+      if (num_samples <= 1024) {
+        int16_t scaled[1024];
+        for (size_t i = 0; i < num_samples; i++) {
+          int32_t sample = (int32_t)(src[i] * ref_scale);
+          if (sample > 32767) sample = 32767;
+          if (sample < -32768) sample = -32768;
+          scaled[i] = (int16_t) sample;
+        }
+        this->speaker_ref_buffer_->write_without_replacement((void *) scaled, written, 0, true);
+      } else {
+        // Fallback: write unscaled for very large buffers
+        this->speaker_ref_buffer_->write_without_replacement((void *) data, written, 0, true);
+      }
+    } else {
+      this->speaker_ref_buffer_->write_without_replacement((void *) data, written, 0, true);
+    }
+  }
+#endif
+
+  return written;
 }
 
 void I2SAudioDuplex::audio_task(void *param) {
@@ -336,24 +405,41 @@ void I2SAudioDuplex::audio_task(void *param) {
 }
 
 void I2SAudioDuplex::audio_task_() {
-  ESP_LOGI(TAG, "Audio task started");
+  ESP_LOGI(TAG, "Audio task started (stereo_aec_ref=%s)", this->use_stereo_aec_ref_ ? "YES" : "no");
+
+  // Determine frame size: use AEC's required chunk size if available, otherwise default
+  size_t frame_size = DEFAULT_FRAME_SIZE;
+#ifdef USE_ESP_AEC
+  if (this->aec_ != nullptr && this->aec_->is_initialized()) {
+    frame_size = this->aec_->get_frame_size();
+    ESP_LOGI(TAG, "Using AEC frame size: %u samples (%ums at 16kHz)",
+             (unsigned)frame_size, (unsigned)(frame_size * 1000 / 16000));
+  }
+#endif
+  size_t frame_bytes = frame_size * sizeof(int16_t);
+
+  // For stereo mode (ES8311 digital feedback), we read 2x data (L=ref, R=mic)
+  size_t rx_frame_bytes = this->use_stereo_aec_ref_ ? (frame_bytes * 2) : frame_bytes;
 
   // Allocate DMA-capable buffers for I2S operations
-  int16_t *mic_buffer = (int16_t *) heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-  int16_t *spk_buffer = (int16_t *) heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  int16_t *rx_buffer = (int16_t *) heap_caps_malloc(rx_frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+  int16_t *mic_buffer = this->use_stereo_aec_ref_ ?
+      (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL) : rx_buffer;
+  int16_t *spk_buffer = (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
   int16_t *spk_ref_buffer = nullptr;  // Speaker reference for AEC
   int16_t *aec_output = nullptr;      // AEC processed output
 
 #ifdef USE_ESP_AEC
   if (this->aec_ != nullptr) {
-    spk_ref_buffer = (int16_t *) heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_INTERNAL);
-    aec_output = (int16_t *) heap_caps_malloc(FRAME_BYTES, MALLOC_CAP_INTERNAL);
+    spk_ref_buffer = (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL);
+    aec_output = (int16_t *) heap_caps_malloc(frame_bytes, MALLOC_CAP_INTERNAL);
   }
 #endif
 
-  if (!mic_buffer || !spk_buffer) {
+  if (!rx_buffer || !spk_buffer || (this->use_stereo_aec_ref_ && !mic_buffer)) {
     ESP_LOGE(TAG, "Failed to allocate audio buffers");
-    if (mic_buffer) heap_caps_free(mic_buffer);
+    if (rx_buffer) heap_caps_free(rx_buffer);
+    if (this->use_stereo_aec_ref_ && mic_buffer) heap_caps_free(mic_buffer);
     if (spk_buffer) heap_caps_free(spk_buffer);
     if (spk_ref_buffer) heap_caps_free(spk_ref_buffer);
     if (aec_output) heap_caps_free(aec_output);
@@ -367,53 +453,85 @@ void I2SAudioDuplex::audio_task_() {
 
     // ══════════════════════════════════════════════════════════════════
     // MICROPHONE READ (RX)
+    // Stereo mode (ES8311 digital feedback): L=reference(DAC), R=mic(ADC)
+    // Mono mode: just mic data, reference from ring buffer
     // ══════════════════════════════════════════════════════════════════
     if (this->rx_handle_ && this->mic_running_) {
-      // Note: i2s_channel_read timeout is in milliseconds (new driver), not ticks
-      esp_err_t err = i2s_channel_read(this->rx_handle_, mic_buffer, FRAME_BYTES,
+      // Read into rx_buffer (stereo or mono depending on mode)
+      esp_err_t err = i2s_channel_read(this->rx_handle_, rx_buffer, rx_frame_bytes,
                                         &bytes_read, I2S_IO_TIMEOUT_MS);
-      if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+      // Don't log INVALID_STATE - this is expected during shutdown (race condition)
+      if (err != ESP_OK && err != ESP_ERR_TIMEOUT && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "i2s_channel_read failed: %s", esp_err_to_name(err));
       }
-      if (err == ESP_OK && bytes_read == FRAME_BYTES) {
+      if (err == ESP_OK && bytes_read == rx_frame_bytes) {
         did_work = true;
         int16_t *output_buffer = mic_buffer;  // Default: no AEC processing
+
+        // ── STEREO MODE: Split interleaved L/R into ref and mic ──
+        if (this->use_stereo_aec_ref_) {
+          // ES8311 digital feedback: L=DAC(ref), R=ADC(mic)
+          // Interleaved: [L0,R0,L1,R1,...] → split to [ref] and [mic]
+          for (size_t i = 0; i < frame_size; i++) {
+            spk_ref_buffer[i] = rx_buffer[i * 2];      // L channel = reference
+            mic_buffer[i] = rx_buffer[i * 2 + 1];      // R channel = mic
+          }
+        }
+
+        // Apply pre-AEC mic attenuation for hot mics (ES8311)
+        // This prevents clipping/distortion BEFORE AEC processing
+        if (this->mic_attenuation_ != 1.0f) {
+          for (size_t i = 0; i < frame_size; i++) {
+            mic_buffer[i] = (int16_t)(mic_buffer[i] * this->mic_attenuation_);
+          }
+        }
 
 #ifdef USE_ESP_AEC
         // Process through AEC if enabled and initialized
         if (this->aec_ != nullptr && this->aec_enabled_ && this->aec_->is_initialized() &&
             spk_ref_buffer != nullptr && aec_output != nullptr) {
-          // Get speaker reference (best effort, pad with silence if not enough data)
-          // Avoid available() which is not thread-safe; read directly and pad
-          if (this->speaker_ref_buffer_ != nullptr) {
-            size_t got_ref = this->speaker_ref_buffer_->read((void *) spk_ref_buffer, FRAME_BYTES, 0);
-            if (got_ref < FRAME_BYTES) {
-              memset(((uint8_t *) spk_ref_buffer) + got_ref, 0, FRAME_BYTES - got_ref);
+
+          // ── MONO MODE: Get reference from ring buffer with delay ──
+          if (!this->use_stereo_aec_ref_) {
+            // Ring buffer approach: need to maintain delay
+            size_t delay_bytes = (SAMPLE_RATE * this->aec_ref_delay_ms_ / 1000) * BYTES_PER_SAMPLE;
+            size_t min_ref_bytes = delay_bytes + frame_bytes;
+            size_t ref_available = this->speaker_ref_buffer_ ? this->speaker_ref_buffer_->available() : 0;
+
+            if (this->speaker_ref_buffer_ != nullptr && ref_available >= min_ref_bytes) {
+              this->speaker_ref_buffer_->read((void *) spk_ref_buffer, frame_bytes, 0);
+            } else {
+              memset(spk_ref_buffer, 0, frame_bytes);
             }
-          } else {
-            memset(spk_ref_buffer, 0, FRAME_BYTES);
           }
+          // STEREO MODE: spk_ref_buffer already filled from L channel split above
+
           // Process AEC: removes echo from mic_buffer using spk_ref_buffer
-          this->aec_->process(mic_buffer, spk_ref_buffer, aec_output, FRAME_SIZE);
+          this->aec_->process(mic_buffer, spk_ref_buffer, aec_output, frame_size);
           output_buffer = aec_output;
+
+          // Debug: log AEC stats periodically (every ~16 seconds)
           if (++this->aec_frame_count_ % 500 == 0) {
-            ESP_LOGD(TAG, "AEC processing: %lu frames", (unsigned long) this->aec_frame_count_);
-          }
-        } else {
-          static bool aec_skip_logged = false;
-          if (!aec_skip_logged) {
-            ESP_LOGW(TAG, "AEC skipped: aec=%p enabled=%d init=%d ref=%p out=%p",
-                     this->aec_, this->aec_enabled_,
-                     this->aec_ ? this->aec_->is_initialized() : false,
-                     spk_ref_buffer, aec_output);
-            aec_skip_logged = true;
+            int64_t mic_sum = 0, ref_sum = 0, out_sum = 0;
+            for (size_t i = 0; i < frame_size; i++) {
+              mic_sum += (int64_t)mic_buffer[i] * mic_buffer[i];
+              ref_sum += (int64_t)spk_ref_buffer[i] * spk_ref_buffer[i];
+              out_sum += (int64_t)aec_output[i] * aec_output[i];
+            }
+            int mic_rms = (int)sqrt((double)mic_sum / frame_size);
+            int ref_rms = (int)sqrt((double)ref_sum / frame_size);
+            int out_rms = (int)sqrt((double)out_sum / frame_size);
+            int reduction = (mic_rms > 0) ? (100 - (out_rms * 100 / mic_rms)) : 0;
+            ESP_LOGI(TAG, "AEC #%lu: mic=%d ref=%d out=%d (%d%% %s)",
+                     (unsigned long)this->aec_frame_count_, mic_rms, ref_rms, out_rms, reduction,
+                     this->use_stereo_aec_ref_ ? "STEREO" : "ringbuf");
           }
         }
 #endif
 
         // Apply mic gain
         if (this->mic_gain_ != 1.0f) {
-          for (size_t i = 0; i < FRAME_SIZE; i++) {
+          for (size_t i = 0; i < frame_size; i++) {
             int32_t sample = (int32_t)(output_buffer[i] * this->mic_gain_);
             // Clamp to int16_t range
             if (sample > 32767) sample = 32767;
@@ -424,7 +542,7 @@ void I2SAudioDuplex::audio_task_() {
 
         // Call callbacks with zero-copy pointer (no vector allocation per frame)
         for (auto &callback : this->mic_callbacks_) {
-          callback((const uint8_t *) output_buffer, FRAME_BYTES);
+          callback((const uint8_t *) output_buffer, frame_bytes);
         }
       }
     }
@@ -435,18 +553,18 @@ void I2SAudioDuplex::audio_task_() {
     // ══════════════════════════════════════════════════════════════════
     if (this->tx_handle_ && this->speaker_running_) {
       // Read whatever is available (non-blocking), pad remainder with silence
-      size_t got = this->speaker_buffer_->read((void *) spk_buffer, FRAME_BYTES, 0);
+      size_t got = this->speaker_buffer_->read((void *) spk_buffer, frame_bytes, 0);
       if (got > 0) {
         did_work = true;  // Had actual audio data to play
       }
-      if (got < FRAME_BYTES) {
+      if (got < frame_bytes) {
         // Pad with silence to maintain frame alignment
-        memset(((uint8_t *) spk_buffer) + got, 0, FRAME_BYTES - got);
+        memset(((uint8_t *) spk_buffer) + got, 0, frame_bytes - got);
       }
 
       // Apply speaker volume with clamp
       if (this->speaker_volume_ != 1.0f) {
-        for (size_t i = 0; i < FRAME_SIZE; i++) {
+        for (size_t i = 0; i < frame_size; i++) {
           int32_t sample = (int32_t)(spk_buffer[i] * this->speaker_volume_);
           if (sample > 32767) sample = 32767;
           if (sample < -32768) sample = -32768;
@@ -454,9 +572,14 @@ void I2SAudioDuplex::audio_task_() {
         }
       }
 
+      // NOTE: AEC reference is now captured in play() method
+      // This fixes the timing - reference is captured when data enters the pipeline
+      // NOT here where speaker_buffer latency would desync the reference
+
       // Note: i2s_channel_write timeout is in milliseconds (new driver), not ticks
-      esp_err_t err = i2s_channel_write(this->tx_handle_, spk_buffer, FRAME_BYTES, &bytes_written, I2S_IO_TIMEOUT_MS);
-      if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
+      esp_err_t err = i2s_channel_write(this->tx_handle_, spk_buffer, frame_bytes, &bytes_written, I2S_IO_TIMEOUT_MS);
+      // Don't log INVALID_STATE - this is expected during shutdown (race condition)
+      if (err != ESP_OK && err != ESP_ERR_TIMEOUT && err != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "i2s_channel_write failed: %s", esp_err_to_name(err));
       }
     }
@@ -469,7 +592,8 @@ void I2SAudioDuplex::audio_task_() {
     }
   }
 
-  heap_caps_free(mic_buffer);
+  heap_caps_free(rx_buffer);
+  if (this->use_stereo_aec_ref_ && mic_buffer) heap_caps_free(mic_buffer);
   heap_caps_free(spk_buffer);
   if (spk_ref_buffer) heap_caps_free(spk_ref_buffer);
   if (aec_output) heap_caps_free(aec_output);
@@ -482,7 +606,7 @@ size_t I2SAudioDuplex::get_speaker_buffer_available() const {
 }
 
 size_t I2SAudioDuplex::get_speaker_buffer_size() const {
-  return 8192;  // SPEAKER_BUFFER_SIZE constant
+  return SPEAKER_BUFFER_SIZE;
 }
 
 }  // namespace i2s_audio_duplex

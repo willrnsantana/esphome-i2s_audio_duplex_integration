@@ -4,6 +4,7 @@
 #
 # Xiaozhi Ball V3 device with ES8311 codec, GC9A01A round display, and WS2812 LED.
 # Uses intercom_api component with HA Broker for ESP↔ESP communication.
+# Clean YAML syntax with native platform entities.
 #
 # HARDWARE:
 #   - Board: ESP32-S3 DevKitC-1 (16MB Flash, Octal PSRAM)
@@ -31,12 +32,38 @@ esphome:
           brightness: 100%
       - light.turn_off: status_led
       - delay: 1s
+      # Configure ES8311 for digital feedback AEC
+      # Register 0x44 bits[6:4] = ADCDAT_SEL: 4 = DACL + ADC
+      # This makes ASDOUT output stereo: L=DAC loopback (reference), R=ADC (mic)
       - lambda: |-
-          // Restore speaker volume from saved state
+          ESP_LOGI("es8311", "Configuring ES8311 register 0x44 for digital feedback...");
+          // ES8311 I2C address is 0x18
+          // First read current value
+          uint8_t reg = 0x44;
+          uint8_t current_val = 0;
+          id(i2c_bus).write(0x18, &reg, 1);
+          id(i2c_bus).read(0x18, &current_val, 1);
+          ESP_LOGI("es8311", "Register 0x44 current value: 0x%02X", current_val);
+
+          // Write new value: bits[6:4]=4 (DACL+ADC)
+          uint8_t data[2] = {0x44, 0x48};
+          auto err = id(i2c_bus).write(0x18, data, 2);
+          if (err == esphome::i2c::ERROR_OK) {
+            ESP_LOGI("es8311", "Wrote register 0x44=0x48 for digital feedback AEC");
+            // Verify
+            id(i2c_bus).write(0x18, &reg, 1);
+            id(i2c_bus).read(0x18, &current_val, 1);
+            ESP_LOGI("es8311", "Register 0x44 after write: 0x%02X", current_val);
+          } else {
+            ESP_LOGE("es8311", "Failed to write register 0x44: error %d", (int)err);
+          }
+      # Restore ES8311 volume and sync AEC reference
+      - lambda: |-
           float vol = 0.15 + (id(speaker_volume).state / 100.0) * 0.60;
           id(es8311_dac).set_volume(vol);
-          // Restore mic gain from saved state (dB)
-          id(intercom).set_mic_gain_db(id(mic_gain).state);
+          // AEC reference must match ES8311 hardware output level
+          id(i2s_duplex).set_aec_reference_volume(vol);
+          id(peer_name) = id(intercom).get_current_destination();
       - script.execute: update_display_page
 
 esp32:
@@ -48,17 +75,28 @@ esp32:
       CONFIG_ESP32S3_DEFAULT_CPU_FREQ_240: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
       CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      # Default is 10, increased for: TCP server + API + OTA + web_server
+      CONFIG_LWIP_MAX_SOCKETS: "16"
     components:
+      # Required for AEC (esp_aec component)
       - espressif/esp-sr^2.3.0
 
 psram:
-  mode: octal
+  mode: octal   # Xiaozhi has octal PSRAM (faster than quad)
   speed: 80MHz
 
 # ==============================================================================
 # CONNECTIVITY
 # ==============================================================================
 api:
+  on_client_connected:
+    - lambda: |-
+        // Only publish once on first HA connection (not on every log viewer connect)
+        static bool published = false;
+        if (!published) {
+          published = true;
+          id(intercom).publish_entity_states();
+        }
 
 ota:
   - platform: esphome
@@ -93,6 +131,7 @@ external_components:
 # I2C BUS (for ES8311 codec control)
 # ==============================================================================
 i2c:
+  id: i2c_bus
   sda: GPIO15
   scl: GPIO14
   scan: false
@@ -105,6 +144,9 @@ audio_dac:
     id: es8311_dac
     bits_per_sample: 16bit
     sample_rate: 16000
+    # use_microphone: false (default) = analog mic input (MIC1P/MIC1N)
+    # use_microphone: true = PDM digital mic (WRONG for Xiaozhi!)
+    mic_gain: 24DB          # Default 42DB is too hot. Try 24DB first.
 
 # ==============================================================================
 # ECHO CANCELLATION
@@ -112,8 +154,8 @@ audio_dac:
 esp_aec:
   id: aec_component
   sample_rate: 16000
-  filter_length: 4
-  mode: voip_low_cost
+  filter_length: 8     # 8 = 128ms tail (max value, covers most latency scenarios)
+  mode: voip_high_perf # High performance AEC for better echo cancellation
 
 # ==============================================================================
 # I2S AUDIO DUPLEX (single bus for ES8311)
@@ -127,6 +169,12 @@ i2s_audio_duplex:
   i2s_dout_pin: GPIO8
   sample_rate: 16000
   aec_id: aec_component
+  # ES8311 digital feedback: RX is stereo with L=DAC(ref), R=ADC(mic)
+  # Gives sample-accurate reference for AEC (no ring buffer timing issues)
+  # Requires ES8311 register 0x44 bits[6:4]=4 (set in on_boot)
+  use_stereo_aec_reference: true
+  # Minimal delay for stereo mode - reference is nearly sample-aligned
+  aec_reference_delay_ms: 10
 
 # ==============================================================================
 # MICROPHONE (via duplex platform)
@@ -157,91 +205,235 @@ output:
 # ==============================================================================
 # INTERCOM API (TCP-based, port 6054)
 # ==============================================================================
+# Auto-creates these sensors:
+#   - text_sensor: intercom_state (Idle/Ringing/Streaming)
+#   - text_sensor: destination (selected contact) [full mode only]
+#   - text_sensor: caller (who is calling) [full mode only]
+#   - text_sensor: contacts (count) [full mode only]
+
 intercom_api:
   id: intercom
+  mode: full              # full = ESP↔ESP calls with contacts, simple = browser only
   microphone: mic_component
   speaker: spk_component
-  aec_id: aec_component
+  # NOTE: AEC is handled by i2s_audio_duplex for better timing (same audio task)
+  ringing_timeout: 30s    # Auto-decline unanswered calls
+
+  # === New FSM triggers for clean page switching ===
+  on_incoming_call:
+    - lambda: 'id(peer_name) = id(intercom).get_caller();'
+    - display.page.show: page_ringing_in
+    - component.update: main_display
+
+  on_outgoing_call:
+    - lambda: 'id(peer_name) = id(intercom).get_current_destination();'
+    - light.turn_on:
+        id: status_led
+        effect: "Calling"
+    - display.page.show: page_ringing_out
+    - component.update: main_display
+    # Doorbell event for "Home Assistant" destination (for HA automations/notifications)
+    # ESP-to-ESP bridge is handled automatically by HA detecting state change to "Outgoing"
+    - if:
+        condition:
+          lambda: 'return id(intercom).get_current_destination() == "Home Assistant";'
+        then:
+          - homeassistant.event:
+              event: esphome.intercom_call
+              data:
+                caller: !lambda 'return App.get_friendly_name();'
+                destination: "Home Assistant"
+                type: "doorbell"
+
+  on_ringing:
+    - light.turn_on:
+        id: status_led
+        effect: "Ringing"
+
+  on_answered:
+    - logger.log: "Call answered"
+
+  on_streaming:
+    - light.turn_on:
+        id: status_led
+        red: 30%
+        green: 69%
+        blue: 31%
+        effect: none
+    - output.turn_on: speaker_enable
+    # Set peer_name: use caller if incoming, else destination if outgoing
+    - lambda: |-
+        std::string caller = id(intercom).get_caller();
+        if (!caller.empty()) {
+          id(peer_name) = caller;  // Incoming call: show who's calling
+        } else {
+          id(peer_name) = id(intercom).get_current_destination();  // Outgoing: show destination
+        }
+    - display.page.show: page_in_call
+    - component.update: main_display
+
+  on_idle:
+    - light.turn_off: status_led
+    - output.turn_off: speaker_enable
+    - lambda: 'id(peer_name) = id(intercom).get_current_destination();'
+    - display.page.show: page_idle
+    - component.update: main_display
+
+  on_hangup:
+    - logger.log:
+        format: "Hangup: %s"
+        args: ['reason.c_str()']
+
+  on_call_failed:
+    - logger.log:
+        format: "Call failed: %s"
+        args: ['reason.c_str()']
 
 # ==============================================================================
-# GLOBALS
+# GLOBALS (only peer_name for display)
 # ==============================================================================
-# SCRIPTS
+globals:
+  - id: peer_name
+    type: std::string
+    restore_value: no
+    initial_value: '"Home Assistant"'
+
+# ==============================================================================
+# SCRIPTS (only display update)
 # ==============================================================================
 script:
-  # Update display page based on intercom state
   - id: update_display_page
     mode: restart
     then:
-      - lambda: |-
-          std::string state = id(intercom_state).state;
-          if (state == "Idle") {
-            id(main_display).show_page(id(page_idle));
-          } else if (state == "Ringing") {
-            id(main_display).show_page(id(page_ringing_in));
-          } else if (state == "Calling") {
-            id(main_display).show_page(id(page_ringing_out));
-          } else if (state == "Streaming") {
-            id(main_display).show_page(id(page_in_call));
-          }
+      - if:
+          condition:
+            intercom_api.is_idle:
+              id: intercom
+          then:
+            - display.page.show: page_idle
+          else:
+            - if:
+                condition:
+                  intercom_api.is_incoming:
+                    id: intercom
+                then:
+                  - display.page.show: page_ringing_in
+                else:
+                  - if:
+                      condition:
+                        intercom_api.is_calling:
+                          id: intercom
+                      then:
+                        - display.page.show: page_ringing_out
+                      else:
+                        - if:
+                            condition:
+                              intercom_api.is_in_call:
+                                id: intercom
+                            then:
+                              - display.page.show: page_in_call
       - component.update: main_display
 
 # ==============================================================================
-# DISPLAY UPDATE INTERVAL
+# DISPLAY UPDATE INTERVAL - DISABLED to prevent SPI race condition
+# Display is updated via update_display_page script on state changes
 # ==============================================================================
-interval:
-  - interval: 1s
-    then:
-      - component.update: main_display
+# interval:
+#   - interval: 1s
+#     then:
+#       - component.update: main_display
 
 # ==============================================================================
-# TEXT SENSORS
+# BUTTONS (all template - no hardcoded platform)
 # ==============================================================================
-text_sensor:
+button:
+  # Smart Call button: idle→call, ringing→answer, streaming→hangup
+  - platform: template
+    id: call_button
+    name: "Call"
+    icon: "mdi:phone"
+    on_press:
+      - intercom_api.call_toggle:
+          id: intercom
+
+  # Next contact (full mode)
+  - platform: template
+    id: next_contact_button
+    name: "Next Contact"
+    icon: "mdi:arrow-right"
+    on_press:
+      - intercom_api.next_contact:
+          id: intercom
+      - lambda: 'id(peer_name) = id(intercom).get_current_destination();'
+      - script.execute: update_display_page
+
+  # Previous contact (full mode)
+  - platform: template
+    id: prev_contact_button
+    name: "Previous Contact"
+    icon: "mdi:arrow-left"
+    on_press:
+      - intercom_api.prev_contact:
+          id: intercom
+      - lambda: 'id(peer_name) = id(intercom).get_current_destination();'
+      - script.execute: update_display_page
+
+  # Decline incoming call
+  - platform: template
+    id: decline_button
+    name: "Decline"
+    icon: "mdi:phone-hangup"
+    on_press:
+      - intercom_api.decline_call:
+          id: intercom
+
+  # Refresh contacts from HA
+  - platform: template
+    id: refresh_contacts_button
+    name: "Refresh Contacts"
+    icon: "mdi:refresh"
+    entity_category: config
+    on_press:
+      - intercom_api.set_contacts:
+          id: intercom
+          contacts_csv: !lambda 'return id(ha_active_devices).state;'
+      - lambda: 'id(peer_name) = id(intercom).get_current_destination();'
+      - script.execute: update_display_page
+
+  - platform: restart
+    name: "Restart"
+    icon: "mdi:restart"
+
+# ==============================================================================
+# SWITCHES (native platform)
+# ==============================================================================
+switch:
   - platform: intercom_api
-    id: intercom_state
-    name: "Intercom State"
     intercom_api_id: intercom
-    on_value:
-      then:
-        - script.execute: update_display_page
-        # LED effects based on state
-        - if:
-            condition:
-              text_sensor.state:
-                id: intercom_state
-                state: "Idle"
-            then:
-              - light.turn_off: status_led
-              - output.turn_off: speaker_enable
-        - if:
-            condition:
-              text_sensor.state:
-                id: intercom_state
-                state: "Ringing"
-            then:
-              - light.turn_on:
-                  id: status_led
-                  effect: "Ringing"
-        - if:
-            condition:
-              text_sensor.state:
-                id: intercom_state
-                state: "Streaming"
-            then:
-              - light.turn_on:
-                  id: status_led
-                  red: 30%
-                  green: 69%
-                  blue: 31%
-                  effect: none
-              - output.turn_on: speaker_enable
+    auto_answer:
+      id: auto_answer_switch
+      name: "Auto Answer"
+      restore_mode: RESTORE_DEFAULT_OFF
+
+  - platform: i2s_audio_duplex
+    i2s_audio_duplex_id: i2s_duplex
+    aec:
+      id: aec_switch
+      name: "Echo Cancellation"
+      restore_mode: RESTORE_DEFAULT_ON
 
 # ==============================================================================
-# VOLUME & GAIN CONTROL
+# NUMBERS (native platform - mic_gain only, speaker uses ES8311)
 # ==============================================================================
 number:
-  # Speaker volume with ES8311 integration
+  - platform: intercom_api
+    intercom_api_id: intercom
+    mic_gain:
+      id: mic_gain
+      name: "Mic Gain"
+
+  # Speaker volume with ES8311 hardware control (different from intercom_api volume)
+  # IMPORTANT: Also sync to i2s_duplex for AEC reference scaling
   - platform: template
     id: speaker_volume
     name: "Speaker Volume"
@@ -255,107 +447,39 @@ number:
     unit_of_measurement: "%"
     set_action:
       - lambda: |-
-          float vol = 0.15 + (x / 100.0) * 0.60;
-          id(es8311_dac).set_volume(vol);
-
-  # Microphone gain (dB scale)
-  - platform: template
-    id: mic_gain
-    name: "Mic Gain"
-    icon: "mdi:microphone"
-    min_value: -20
-    max_value: 20
-    step: 1
-    initial_value: 0
-    optimistic: true
-    restore_value: true
-    unit_of_measurement: "dB"
-    set_action:
-      - lambda: 'id(intercom).set_mic_gain_db(x);'
+          // ES8311 volume range: 0.15 (min) to 0.75 (max)
+          float es8311_vol = 0.15 + (x / 100.0) * 0.60;
+          id(es8311_dac).set_volume(es8311_vol);
+          // AEC reference must match ES8311 hardware output level
+          // This ensures reference amplitude matches actual echo picked up by mic
+          id(i2s_duplex).set_aec_reference_volume(es8311_vol);
 
 # ==============================================================================
-# SWITCHES
+# TEXT SENSORS
 # ==============================================================================
-switch:
-  # Echo cancellation toggle
-  - platform: template
-    id: aec_switch
-    name: "Echo Cancellation"
-    icon: "mdi:ear-hearing"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_ON
-    turn_on_action:
-      - lambda: 'id(intercom).set_aec_enabled(true);'
-    turn_off_action:
-      - lambda: 'id(intercom).set_aec_enabled(false);'
-
-  # Auto-answer toggle
-  - platform: template
-    id: auto_answer_switch
-    name: "Auto Answer"
-    icon: "mdi:phone-incoming"
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    turn_on_action:
-      - lambda: 'id(intercom).set_auto_answer(true);'
-    turn_off_action:
-      - lambda: 'id(intercom).set_auto_answer(false);'
-
-# ==============================================================================
-# BUTTONS
-# ==============================================================================
-button:
-  # Call/Answer/Hangup button (P2P mode - calls Home Assistant only)
-  - platform: template
-    id: call_button
-    name: "Call"
-    icon: "mdi:phone"
-    on_press:
-      - lambda: |-
-          std::string state = id(intercom_state).state;
-
-          // If ringing (incoming call), answer it
-          if (state == "Ringing") {
-            id(intercom).answer_call();
-            id(speaker_enable).turn_on();
-            return;
-          }
-
-          // If in call or streaming, hang up
-          if (state == "Streaming" || state == "Calling") {
-            id(intercom).stop();
-            id(speaker_enable).turn_off();
-            return;
-          }
-
-          // IDLE: Call Home Assistant
-          id(speaker_enable).turn_on();
-      # Fire doorbell event when calling Home Assistant
-      - if:
-          condition:
-            lambda: 'return id(intercom_state).state == "Idle";'
-          then:
-            - homeassistant.event:
-                event: esphome.doorbell_ring
-                data:
-                  device: "${name}"
-            - lambda: 'id(intercom).start();'
-
-  - platform: restart
-    name: "Restart"
-    icon: "mdi:restart"
+text_sensor:
+  - platform: homeassistant
+    id: ha_active_devices
+    entity_id: sensor.intercom_active_devices
+    on_value:
+      - intercom_api.set_contacts:
+          id: intercom
+          contacts_csv: !lambda 'return x;'
+      - lambda: 'id(peer_name) = id(intercom).get_current_destination();'
+      - script.execute: update_display_page
 
 # ==============================================================================
 # BINARY SENSORS
 # ==============================================================================
 binary_sensor:
-  # Node status (connected to HA API)
   - platform: status
     id: node_status
     name: "Status"
 
-  # Main button - short press: call/answer/hangup
-  # NOTE: Long press for next contact disabled in P2P mode (no broker)
+  # Main button using on_multi_click for proper single/double/triple detection
+  #   - Single click: call/answer/hangup (smart button)
+  #   - Double click: next contact (if idle) or decline (if ringing)
+  #   - Triple click: refresh contacts
   - platform: gpio
     pin:
       number: GPIO0
@@ -364,10 +488,46 @@ binary_sensor:
     id: main_button
     name: "Main Button"
     icon: "mdi:gesture-tap-button"
-    on_press:
-      - button.press: call_button
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_multi_click:
+      # Single click: call/answer/hangup
+      - timing:
+          - ON for 50ms to 500ms
+          - OFF for at least 400ms
+        then:
+          - button.press: call_button
+      # Double click: next contact or decline
+      - timing:
+          - ON for 50ms to 500ms
+          - OFF for 50ms to 400ms
+          - ON for 50ms to 500ms
+          - OFF for at least 400ms
+        then:
+          - if:
+              condition:
+                intercom_api.is_ringing:
+                  id: intercom
+              then:
+                - button.press: decline_button
+              else:
+                - if:
+                    condition:
+                      intercom_api.is_idle:
+                        id: intercom
+                    then:
+                      - button.press: next_contact_button
+      # Triple click: refresh contacts
+      - timing:
+          - ON for 50ms to 500ms
+          - OFF for 50ms to 400ms
+          - ON for 50ms to 500ms
+          - OFF for 50ms to 400ms
+          - ON for 50ms to 500ms
+        then:
+          - button.press: refresh_contacts_button
 
-  # Display touch input
   - platform: gpio
     pin:
       number: GPIO12
@@ -539,28 +699,24 @@ display:
       height: 240
       width: 240
     pages:
-      # ----------------------------------------------------------------------
-      # PAGE: IDLE - Blue background, system status in footer
-      # ----------------------------------------------------------------------
+      # PAGE: IDLE
       - id: page_idle
         lambda: |-
-          constexpr int cx = 120;  // 240/2
+          constexpr int cx = 120;
           constexpr int h = 240;
           it.fill(id(color_blue));
           it.print(cx, 30, id(font_title), id(color_white), TextAlign::CENTER, "${friendly_name}");
           it.print(cx, 70, id(font_debug), id(color_white), TextAlign::CENTER, "Status:");
           it.print(cx, 100, id(font_state), id(color_green), TextAlign::CENTER, "IDLE");
-          it.print(cx, 130, id(font_debug), id(color_white), TextAlign::CENTER, "Target:");
-          it.print(cx, 150, id(font_info), id(color_white), TextAlign::CENTER, "Home Assistant");
+          it.print(cx, 130, id(font_debug), id(color_white), TextAlign::CENTER, "Destination:");
+          it.print(cx, 150, id(font_info), id(color_white), TextAlign::CENTER, id(peer_name).c_str());
           char buf[32];
           snprintf(buf, sizeof(buf), "WiFi: %.0f%%", id(wifi_pct).state);
           it.print(cx, h - 35, id(font_debug), id(color_white), TextAlign::CENTER, buf);
           it.print(cx, h - 15, id(font_debug), id(color_white), TextAlign::CENTER,
                    id(node_status).state ? "HA: OK" : "HA: --");
 
-      # ----------------------------------------------------------------------
-      # PAGE: RINGING_IN - Red background, shows caller name
-      # ----------------------------------------------------------------------
+      # PAGE: RINGING_IN
       - id: page_ringing_in
         lambda: |-
           constexpr int cx = 120;
@@ -569,12 +725,10 @@ display:
           it.print(cx, 70, id(font_debug), id(color_white), TextAlign::CENTER, "Status:");
           it.print(cx, 100, id(font_state), id(color_yellow), TextAlign::CENTER, "RINGING");
           it.print(cx, 130, id(font_debug), id(color_white), TextAlign::CENTER, "Incoming call from:");
-          it.print(cx, 160, id(font_info), id(color_white), TextAlign::CENTER, "Home Assistant");
+          it.print(cx, 160, id(font_info), id(color_white), TextAlign::CENTER, id(peer_name).c_str());
           it.print(cx, 200, id(font_debug), id(color_yellow), TextAlign::CENTER, "Press button to answer");
 
-      # ----------------------------------------------------------------------
-      # PAGE: RINGING_OUT - Orange background, shows who we're calling
-      # ----------------------------------------------------------------------
+      # PAGE: RINGING_OUT
       - id: page_ringing_out
         lambda: |-
           constexpr int cx = 120;
@@ -583,12 +737,10 @@ display:
           it.print(cx, 70, id(font_debug), id(color_white), TextAlign::CENTER, "Status:");
           it.print(cx, 100, id(font_state), id(color_black), TextAlign::CENTER, "CALLING");
           it.print(cx, 130, id(font_debug), id(color_white), TextAlign::CENTER, "Calling:");
-          it.print(cx, 160, id(font_info), id(color_white), TextAlign::CENTER, "Home Assistant");
+          it.print(cx, 160, id(font_info), id(color_white), TextAlign::CENTER, id(peer_name).c_str());
           it.print(cx, 200, id(font_debug), id(color_white), TextAlign::CENTER, "Waiting for answer...");
 
-      # ----------------------------------------------------------------------
-      # PAGE: IN_CALL - Green background, connected
-      # ----------------------------------------------------------------------
+      # PAGE: IN_CALL
       - id: page_in_call
         lambda: |-
           constexpr int cx = 120;
@@ -598,5 +750,5 @@ display:
           it.print(cx, 70, id(font_debug), id(color_white), TextAlign::CENTER, "Status:");
           it.print(cx, 100, id(font_state), id(color_blue), TextAlign::CENTER, "IN CALL");
           it.print(cx, 130, id(font_debug), id(color_white), TextAlign::CENTER, "Connected to:");
-          it.print(cx, 150, id(font_info), id(color_white), TextAlign::CENTER, "Home Assistant");
+          it.print(cx, 150, id(font_info), id(color_white), TextAlign::CENTER, id(peer_name).c_str());
           it.print(cx, h - 15, id(font_debug), id(color_white), TextAlign::CENTER, "Press button to hang up");

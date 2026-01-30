@@ -24,11 +24,11 @@ I2SAudioDuplexSpeaker = i2s_audio_duplex_ns.class_(
 def _apply_audio_limits(config):
     audio.set_stream_limits(
         min_channels=1,
-        max_channels=1,
-        min_sample_rate=16000,
-        max_sample_rate=16000,
-        min_bits_per_sample=16,
-        max_bits_per_sample=16,
+        max_channels=2,
+        min_sample_rate=8000,
+        max_sample_rate=48000,
+        min_bits_per_sample=8,
+        max_bits_per_sample=32,
     )(config)
     return config
 

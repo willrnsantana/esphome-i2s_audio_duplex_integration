@@ -19,6 +19,7 @@ MSG_ANSWER = 0x08    # ESP→HA: call answered locally, start stream
 # Message flags
 FLAG_NONE = 0x00
 FLAG_END = 0x01
+FLAG_NO_RING = 0x02  # START flag: skip ringing, start streaming directly (for caller in bridge)
 
 # Error codes
 ERR_OK = 0x00

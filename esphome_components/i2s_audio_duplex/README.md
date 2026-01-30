@@ -57,9 +57,9 @@ intercom_api:
 - **True Full-Duplex**: Simultaneous mic input and speaker output
 - **Standard Platforms**: Exposes `microphone` and `speaker` platform classes
 - **Single I2S Bus**: Efficient use of hardware resources
-- **AEC Integration**: Built-in support for echo cancellation
-- **Volume Control**: Software gain for mic and speaker
+- **Volume Control**: Software gain for speaker output
 - **Hardware Optimized**: Uses ESP-IDF native I2S drivers
+- **Intercom Compatible**: Works seamlessly with `intercom_api` component
 
 ## Use Cases
 
@@ -99,7 +99,7 @@ i2s_audio_duplex:
   i2s_din_pin: GPIO10        # Data In (from codec ADC → ESP mic)
   i2s_dout_pin: GPIO8        # Data Out (from ESP → codec DAC speaker)
   sample_rate: 16000
-  aec_id: aec_component      # Optional: link to esp_aec
+  # NOTE: AEC should be configured in intercom_api, NOT here
 
 # Standard microphone platform
 microphone:
@@ -125,7 +125,40 @@ speaker:
 | `i2s_din_pin` | pin | -1 | Data input from codec (microphone) |
 | `i2s_dout_pin` | pin | -1 | Data output to codec (speaker) |
 | `sample_rate` | int | 16000 | Audio sample rate (8000-48000) |
-| `aec_id` | ID | - | Optional esp_aec component for echo cancellation |
+| `aec_id` | ID | - | Reference to esp_aec component for echo cancellation |
+| `aec_reference_delay_ms` | int | 80 | AEC reference delay (10-200ms) |
+| `mic_attenuation` | float | 1.0 | Pre-AEC mic attenuation (0.01-1.0, for hot mics) |
+| `use_stereo_aec_reference` | bool | false | ES8311 digital feedback mode (see below) |
+
+### ES8311 Digital Feedback AEC (Recommended)
+
+For **ES8311 codec**, enable `use_stereo_aec_reference` for **perfect echo cancellation**:
+
+```yaml
+i2s_audio_duplex:
+  id: i2s_duplex
+  # ... pins ...
+  aec_id: aec_component
+  use_stereo_aec_reference: true  # ES8311 digital feedback
+  aec_reference_delay_ms: 10      # Minimal delay (sample-aligned)
+```
+
+**How it works:**
+- ES8311 register 0x44 is configured to output DAC+ADC on ASDOUT as stereo
+- L channel = DAC loopback (reference signal)
+- R channel = ADC (microphone)
+- Reference is **sample-accurate** (same I2S frame as mic) → perfect AEC
+
+**Configure ES8311 register in on_boot:**
+```yaml
+esphome:
+  on_boot:
+    - lambda: |-
+        uint8_t data[2] = {0x44, 0x48};  // ADCDAT_SEL = DACL+ADC
+        id(i2c_bus).write(0x18, data, 2);
+```
+
+> **Note**: Without `use_stereo_aec_reference`, the component uses a ring buffer for reference which has timing issues. The stereo mode eliminates these problems entirely.
 
 ## Pin Mapping by Codec
 
@@ -196,7 +229,7 @@ i2s_audio_duplex:
   i2s_din_pin: GPIO10
   i2s_dout_pin: GPIO8
   sample_rate: 16000
-  aec_id: aec
+  # NOTE: AEC is handled by intercom_api, NOT here
 
 microphone:
   - platform: i2s_audio_duplex
@@ -212,7 +245,7 @@ intercom_api:
   id: intercom
   microphone: mic_component
   speaker: spk_component
-  aec_id: aec
+  aec_id: aec  # AEC configured HERE, not in i2s_audio_duplex
 ```
 
 ## When to Use This vs Standard i2s_audio
@@ -244,9 +277,9 @@ intercom_api:
 3. Verify PSRAM is working if using AEC
 
 ### Echo Issues
-1. Link esp_aec component via aec_id
+1. Configure AEC in `intercom_api` component via `aec_id`
 2. Increase AEC filter_length (4-6 recommended)
-3. Verify speaker reference is being captured
+3. Ensure `esp_aec` component is properly set up
 
 ### Mic Not Working
 1. Check din_pin wiring
@@ -259,9 +292,9 @@ intercom_api:
 |---------|-----------------|-------------------|
 | Single-bus codecs | Full support | Half-duplex only |
 | Standard mic/speaker class | Yes | Yes |
-| AEC integration | Built-in | Requires custom code |
 | Simultaneous I/O | Native | Shared bus conflicts |
-| Voice Assistant compatible | Yes | Yes (separate buses only) |
+| Intercom API compatible | Yes | Yes (separate buses only) |
+| Voice Assistant compatible | Untested | Yes |
 
 ## License
 

@@ -13,9 +13,11 @@ static const char *const TAG = "i2s_duplex.spk";
 void I2SAudioDuplexSpeaker::setup() {
   ESP_LOGCONFIG(TAG, "Setting up I2S Audio Duplex Speaker...");
 
+  // Create counting semaphore for reference counting multiple listeners
+  // Initialized to MAX_LISTENERS (all available) - taking decrements, giving increments
   this->active_listeners_semaphore_ = xSemaphoreCreateCounting(MAX_LISTENERS, MAX_LISTENERS);
   if (this->active_listeners_semaphore_ == nullptr) {
-    ESP_LOGE(TAG, "Creating semaphore failed");
+    ESP_LOGE(TAG, "Failed to create semaphore");
     this->mark_failed();
     return;
   }
@@ -36,6 +38,8 @@ void I2SAudioDuplexSpeaker::start() {
   if (this->is_failed())
     return;
 
+  // Take semaphore to register as active listener
+  // Non-blocking (0 timeout) - if all slots taken, this listener won't be counted
   xSemaphoreTake(this->active_listeners_semaphore_, 0);
 }
 
@@ -43,6 +47,7 @@ void I2SAudioDuplexSpeaker::stop() {
   if (this->state_ == speaker::STATE_STOPPED || this->is_failed())
     return;
 
+  // Give semaphore to unregister as listener
   xSemaphoreGive(this->active_listeners_semaphore_);
 }
 
@@ -101,43 +106,41 @@ void I2SAudioDuplexSpeaker::set_mute_state(bool mute_state) {
 }
 
 void I2SAudioDuplexSpeaker::loop() {
-  // Start the speaker if any semaphores are taken
-  if ((uxSemaphoreGetCount(this->active_listeners_semaphore_) < MAX_LISTENERS) &&
-      (this->state_ == speaker::STATE_STOPPED)) {
+  // Check semaphore count to decide when to start/stop
+  UBaseType_t count = uxSemaphoreGetCount(this->active_listeners_semaphore_);
+
+  // Start the speaker if any semaphores are taken (listeners active)
+  if ((count < MAX_LISTENERS) && (this->state_ == speaker::STATE_STOPPED)) {
     this->state_ = speaker::STATE_STARTING;
   }
-  // Stop the speaker if all semaphores are returned
-  if ((uxSemaphoreGetCount(this->active_listeners_semaphore_) == MAX_LISTENERS) &&
-      (this->state_ == speaker::STATE_RUNNING)) {
+
+  // Stop the speaker if all semaphores are returned (no listeners)
+  if ((count == MAX_LISTENERS) && (this->state_ == speaker::STATE_RUNNING)) {
     this->state_ = speaker::STATE_STOPPING;
   }
 
   switch (this->state_) {
     case speaker::STATE_STARTING:
-
       if (this->status_has_error()) {
         break;
       }
 
       ESP_LOGI(TAG, "Starting speaker...");
-      // Start the parent duplex component (handles both mic and speaker)
       this->parent_->start_speaker();
-
       this->state_ = speaker::STATE_RUNNING;
       ESP_LOGI(TAG, "Speaker started");
-
       break;
+
     case speaker::STATE_RUNNING:
       break;
+
     case speaker::STATE_STOPPING:
       ESP_LOGI(TAG, "Stopping speaker...");
-
-      // Stop the parent duplex component
       this->parent_->stop_speaker();
-
       this->state_ = speaker::STATE_STOPPED;
-  ESP_LOGI(TAG, "Speaker stopped");
+      ESP_LOGI(TAG, "Speaker stopped");
       break;
+
     case speaker::STATE_STOPPED:
       break;
   }
