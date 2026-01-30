@@ -23,6 +23,7 @@ from .. import (
     CONF_PRIMARY,
     CONF_I2S_MODE,
     i2s_audio_component_schema,
+    register_i2s_audio_component,
 )
 
 DEPENDENCIES = ["i2s_audio_duplex"]
