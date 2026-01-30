@@ -24,6 +24,12 @@ CONF_MIC_ATTENUATION = "mic_attenuation"
 CONF_USE_STEREO_AEC_REF = "use_stereo_aec_reference"
 CONF_I2S_AUDIO_DUPLEX_ID = "i2s_audio_duplex_id"
 
+CONF_MONO = "mono"
+CONF_LEFT = "left"
+CONF_RIGHT = "right"
+CONF_STEREO = "stereo"
+CONF_BOTH = "both"
+
 i2s_audio_duplex_ns = cg.esphome_ns.namespace("i2s_audio_duplex")
 I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
 
