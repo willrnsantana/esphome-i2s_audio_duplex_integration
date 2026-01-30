@@ -76,7 +76,6 @@ _BASE_SCHEMA = microphone.MICROPHONE_SCHEMA.extend(
         default_bits_per_sample="16bit",
     ).extend(
         {
-            cv.Optional(CONF_CORRECT_DC_OFFSET, default=False): cv.boolean,
             cv.GenerateID(): cv.declare_id(I2SAudioDuplexMicrophone),
             cv.GenerateID(CONF_I2S_AUDIO_DUPLEX_ID): cv.use_id(I2SAudioDuplex),
         }
