@@ -70,7 +70,7 @@ def _set_stream_limits(config):
 
 _BASE_SCHEMA = microphone.MICROPHONE_SCHEMA.extend(
     i2s_audio_component_schema(
-        I2SAudioMicrophone,
+        I2SAudioDuplexMicrophone,
         default_sample_rate=16000,
         default_channel=CONF_RIGHT,
         default_bits_per_sample="16bit",
