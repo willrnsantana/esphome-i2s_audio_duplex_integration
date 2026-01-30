@@ -6,7 +6,7 @@ Voice Assistant and intercom_api components.
 import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import pins
-from esphome.const import CONF_ID
+from esphome.const import CONF_ID, CONF_BITS_PER_SAMPLE, CONF_CHANNEL
 
 CODEOWNERS = ["@n-IA-hane"]
 DEPENDENCIES = []
@@ -29,6 +29,32 @@ CONF_LEFT = "left"
 CONF_RIGHT = "right"
 CONF_STEREO = "stereo"
 CONF_BOTH = "both"
+CONF_BITS_PER_CHANNEL = "bits_per_channel"
+
+i2s_bits_per_chan_t = cg.global_ns.enum("i2s_bits_per_chan_t")
+I2S_BITS_PER_CHANNEL = {
+    "default": i2s_bits_per_chan_t.I2S_BITS_PER_CHAN_DEFAULT,
+    8: i2s_bits_per_chan_t.I2S_BITS_PER_CHAN_8BIT,
+    16: i2s_bits_per_chan_t.I2S_BITS_PER_CHAN_16BIT,
+    24: i2s_bits_per_chan_t.I2S_BITS_PER_CHAN_24BIT,
+    32: i2s_bits_per_chan_t.I2S_BITS_PER_CHAN_32BIT,
+}
+
+i2s_bits_per_sample_t = cg.global_ns.enum("i2s_bits_per_sample_t")
+I2S_BITS_PER_SAMPLE = {
+    8: i2s_bits_per_sample_t.I2S_BITS_PER_SAMPLE_8BIT,
+    16: i2s_bits_per_sample_t.I2S_BITS_PER_SAMPLE_16BIT,
+    24: i2s_bits_per_sample_t.I2S_BITS_PER_SAMPLE_24BIT,
+    32: i2s_bits_per_sample_t.I2S_BITS_PER_SAMPLE_32BIT,
+}
+
+i2s_channel_fmt_t = cg.global_ns.enum("i2s_channel_fmt_t")
+I2S_CHANNELS = {
+    CONF_MONO: i2s_channel_fmt_t.I2S_CHANNEL_FMT_ALL_LEFT,  # left data to both channels
+    CONF_LEFT: i2s_channel_fmt_t.I2S_CHANNEL_FMT_ONLY_LEFT,  # mono data
+    CONF_RIGHT: i2s_channel_fmt_t.I2S_CHANNEL_FMT_ONLY_RIGHT,  # mono data
+    CONF_STEREO: i2s_channel_fmt_t.I2S_CHANNEL_FMT_RIGHT_LEFT,  # stereo data to both channels
+}
 
 i2s_audio_duplex_ns = cg.esphome_ns.namespace("i2s_audio_duplex")
 I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
@@ -36,6 +62,34 @@ I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
 # Forward declare esp_aec
 esp_aec_ns = cg.esphome_ns.namespace("esp_aec")
 EspAec = esp_aec_ns.class_("EspAec")
+
+def i2s_audio_component_schema(
+    class_: MockObjClass,
+    *,
+    default_sample_rate: int,
+    default_channel: str,
+    default_bits_per_sample: str,
+):
+    return cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(class_),
+            cv.GenerateID(CONF_I2S_AUDIO_DUPLEX_ID): cv.use_id(I2SAudioDuplex),
+            cv.Optional(CONF_CHANNEL, default=default_channel): cv.one_of(
+                *I2S_CHANNELS
+            ),
+            cv.Optional(CONF_SAMPLE_RATE, default=default_sample_rate): cv.int_range(
+                min=1
+            ),
+            cv.Optional(CONF_BITS_PER_SAMPLE, default=default_bits_per_sample): cv.All(
+                _validate_bits, cv.one_of(*I2S_BITS_PER_SAMPLE)
+            ),
+            cv.Optional(CONF_BITS_PER_CHANNEL, default="default"): cv.All(
+                cv.Any(cv.float_with_unit("bits", "bit"), "default"),
+                cv.one_of(*I2S_BITS_PER_CHANNEL),
+            ),
+        }
+    )
+
 
 CONFIG_SCHEMA = cv.Schema({
     cv.GenerateID(): cv.declare_id(I2SAudioDuplex),
