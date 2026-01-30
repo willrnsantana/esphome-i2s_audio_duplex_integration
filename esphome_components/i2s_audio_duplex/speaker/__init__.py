@@ -20,6 +20,7 @@ from .. import (
     CONF_LEFT,
     CONF_MONO,
     CONF_RIGHT,
+    CONF_I2S_MODE,
     i2s_audio_component_schema,
 )
 
