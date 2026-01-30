@@ -14,6 +14,7 @@ from .. import (
     i2s_audio_duplex_ns,
     I2SAudioDuplex,
     CONF_I2S_AUDIO_DUPLEX_ID,
+    i2s_audio_component_schema,
     CONF_LEFT,
     CONF_MONO,
     CONF_RIGHT,
