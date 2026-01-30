@@ -131,4 +131,4 @@ async def to_code(config):
 
     parent = await cg.get_variable(config[CONF_I2S_AUDIO_DUPLEX_ID])
     cg.add(var.set_parent(parent))
-    cg.add(var.set_buffer_duration(config[CONF_BUFFER_DURATION]))
+    #cg.add(var.set_buffer_duration(config[CONF_BUFFER_DURATION]))
