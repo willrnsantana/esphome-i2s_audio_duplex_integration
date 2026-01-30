@@ -29,12 +29,11 @@ class I2SAudioDuplexMicrophone : public microphone::Microphone,
   //void loop() override;
 
  protected:
+  // Reference counting for multiple listeners (voice_assistant, wake_word, intercom, etc.)
   SemaphoreHandle_t active_listeners_semaphore_{nullptr};
 
   void on_audio_data_(const uint8_t *data, size_t len);
 
-  // Reference counting for multiple listeners (voice_assistant, wake_word, intercom, etc.)
-  SemaphoreHandle_t active_listeners_semaphore_{nullptr};
 };
 
 }  // namespace i2s_audio_duplex
