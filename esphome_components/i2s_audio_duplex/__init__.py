@@ -26,6 +26,8 @@ CONF_USE_STEREO_AEC_REF = "use_stereo_aec_reference"
 CONF_I2S_AUDIO_DUPLEX_ID = "i2s_audio_duplex_id"
 
 CONF_I2S_MODE = "i2s_mode"
+CONF_PRIMARY = "primary"
+CONF_SECONDARY = "secondary"
 
 CONF_MONO = "mono"
 CONF_LEFT = "left"
