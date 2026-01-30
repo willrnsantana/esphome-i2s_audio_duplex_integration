@@ -76,22 +76,6 @@ I2SAudioDuplex = i2s_audio_duplex_ns.class_("I2SAudioDuplex", cg.Component)
 esp_aec_ns = cg.esphome_ns.namespace("esp_aec")
 EspAec = esp_aec_ns.class_("EspAec")
 
-async def register_i2s_audio_component(var, config):
-    await cg.register_parented(var, config[CONF_I2S_AUDIO_ID])
-    if use_legacy():
-        cg.add(var.set_i2s_mode(I2S_MODE_OPTIONS[config[CONF_I2S_MODE]]))
-        cg.add(var.set_channel(I2S_CHANNELS[config[CONF_CHANNEL]]))
-        cg.add(
-            var.set_bits_per_sample(I2S_BITS_PER_SAMPLE[config[CONF_BITS_PER_SAMPLE]])
-        )
-        cg.add(
-            var.set_bits_per_channel(
-                I2S_BITS_PER_CHANNEL[config[CONF_BITS_PER_CHANNEL]]
-            )
-        )
-    cg.add(var.set_sample_rate(config[CONF_SAMPLE_RATE]))
-
-
 def i2s_audio_component_schema(
     class_: MockObjClass,
     *,
