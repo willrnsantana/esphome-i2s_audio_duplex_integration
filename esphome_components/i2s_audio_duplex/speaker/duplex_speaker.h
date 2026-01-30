@@ -25,7 +25,7 @@ class I2SAudioDuplexSpeaker : public speaker::Speaker,
   // speaker::Speaker interface
   void start() override;
   void stop() override;
-  void loop() override;
+  //void loop() override;
   void finish() override;
 
   size_t play(const uint8_t *data, size_t length) override;

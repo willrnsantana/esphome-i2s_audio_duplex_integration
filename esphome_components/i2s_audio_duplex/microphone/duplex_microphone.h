@@ -26,7 +26,7 @@ class I2SAudioDuplexMicrophone : public microphone::Microphone,
   // microphone::Microphone interface
   void start() override;
   void stop() override;
-  void loop() override;
+  //void loop() override;
 
  protected:
   SemaphoreHandle_t active_listeners_semaphore_{nullptr};
